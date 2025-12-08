@@ -176,7 +176,7 @@ pub async fn list_for_multiple_actors_and_targets(
                             .add_option(
                                 target
                                     .inherited
-                                    .map(|x| db_assignment::Column::Inherited.eq(x)),
+                                    .map(|x| db_system_assignment::Column::Inherited.eq(x)),
                             ),
                     );
                     include_system = true;
