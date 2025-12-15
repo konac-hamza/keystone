@@ -58,8 +58,8 @@ use crate::assignment::backend::{AssignmentBackend, SqlBackend};
 use crate::assignment::error::AssignmentProviderError;
 use crate::assignment::types::{
     Assignment, Role, RoleAssignmentListForMultipleActorTargetParametersBuilder,
-    RoleAssignmentListParameters, RoleAssignmentTarget, RoleAssignmentTargetType,
-    RoleListParameters,RoleCreate,
+    RoleAssignmentListParameters, RoleAssignmentTarget, RoleAssignmentTargetType, RoleCreate,
+    RoleListParameters,
 };
 use crate::config::Config;
 use crate::identity::IdentityApi;
@@ -129,6 +129,17 @@ impl AssignmentApi for AssignmentProvider {
         state: &ServiceState,
         params: RoleCreate,
     ) -> Result<Role, AssignmentProviderError> {
+        params.validate()?;
+
+        // mod_user.id = Uuid::new_v4().simple().to_string();
+
+        // Create Role ID
+        let role_id = params
+            .id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        // Check
         self.backend_driver.create_role(state, params).await
     }
 

@@ -13,7 +13,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use axum::{
-    extract::{Path, Query, State,Json},
+    extract::{Json, Path, Query, State},
+    http::StatusCode,
     response::IntoResponse,
 };
 use utoipa_axum::{router::OpenApiRouter, routes};
@@ -23,15 +24,14 @@ use crate::api::auth::Auth;
 use crate::api::error::KeystoneApiError;
 use crate::assignment::AssignmentApi;
 use crate::keystone::ServiceState;
-use types::{Role, RoleList, RoleListParameters, RoleResponse,RoleCreate};
+use types::{Role, RoleCreate, RoleList, RoleListParameters, RoleResponse};
 
 pub mod types;
 
 pub(crate) fn openapi_router() -> OpenApiRouter<ServiceState> {
     OpenApiRouter::new()
-        .routes(routes!(list))
+        .routes(routes!(list, create))
         .routes(routes!(show))
-        .routes(routes!(create))
 }
 
 /// List roles
@@ -115,9 +115,10 @@ async fn create(
     Json(payload): Json<RoleCreate>,
 ) -> Result<impl IntoResponse, KeystoneApiError> {
     // Validate the request
-    payload.validate()
+    payload
+        .validate()
         .map_err(|e| KeystoneApiError::BadRequest(e.to_string()))?;
-    
+
     // Create the role
     let created_role = state
         .provider
@@ -125,13 +126,15 @@ async fn create(
         .create_role(&state, payload.into())
         .await
         .map_err(KeystoneApiError::assignment)?;
-    
+
     // Return response with 201 Created status
     Ok((
+        StatusCode::CREATED,
         Json(RoleResponse {
             role: created_role.into(),
         }),
-    ))
+    )
+        .into_response())
 }
 
 #[cfg(test)]
@@ -155,7 +158,7 @@ mod tests {
     };
     use crate::assignment::{
         MockAssignmentProvider,
-        types::{Role, RoleListParameters,RoleCreate},
+        types::{Role, RoleCreate, RoleListParameters},
     };
 
     use crate::config::Config;
@@ -398,9 +401,11 @@ mod tests {
             .with_state(state.clone());
 
         let payload = json!({
+            "id": "",
             "name": "new_role",
             "domain_id": "domain1",
-            "description": "A new role"
+            "description": "A new role",
+            "extra": {}
         });
 
         let response = api
@@ -417,7 +422,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::CREATED);
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let res: RoleResponse = serde_json::from_slice(&body).unwrap();

@@ -15,16 +15,16 @@
 use serde_json::Value;
 use tracing::error;
 
-mod list;
 mod create;
+mod list;
 
+pub use create::create;
 pub use list::get;
 pub use list::list;
-pub use create::create;
 
-use crate::assignment::backend::error::{AssignmentDatabaseError, db_err};
+use crate::assignment::backend::error::AssignmentDatabaseError;
 use crate::assignment::types::*;
-use crate::db::entity::{ role as db_role};
+use crate::db::entity::role as db_role;
 
 static NULL_DOMAIN_ID: &str = "<<null>>";
 

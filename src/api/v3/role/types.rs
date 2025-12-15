@@ -121,13 +121,8 @@ impl From<RoleListParameters> for types::RoleListParameters {
     }
 }
 
-
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize, ToSchema, Validate)]
 pub struct RoleCreate {
-    /// Role ID
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[validate(length(max = 64))]
-    pub id: Option<String>,
     /// Role domain ID
     #[serde(skip_serializing_if = "Option::is_none")]
     #[validate(length(max = 64))]
@@ -145,7 +140,7 @@ pub struct RoleCreate {
 impl From<RoleCreate> for types::RoleCreate {
     fn from(value: RoleCreate) -> Self {
         Self {
-            id: value.id,
+            id: Some(String::new()),
             domain_id: value.domain_id,
             name: value.name,
             description: value.description,

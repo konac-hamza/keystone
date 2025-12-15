@@ -17,7 +17,7 @@ use mockall::mock;
 use crate::assignment::AssignmentApi;
 use crate::assignment::AssignmentProviderError;
 use crate::assignment::types::{
-    Assignment, Role, RoleAssignmentListParameters, RoleListParameters,RoleCreate,
+    Assignment, Role, RoleAssignmentListParameters, RoleCreate, RoleListParameters,
 };
 use crate::config::Config;
 use crate::keystone::ServiceState;

@@ -66,7 +66,7 @@ impl AssignmentBackend for SqlBackend {
         state: &ServiceState,
         params: RoleCreate,
     ) -> Result<Role, AssignmentProviderError> {
-        Ok(role::create(&self.config, &state.db, &params).await?)
+        Ok(role::create(&state.db, &params).await?)
     }
     /// List role assignments
     #[tracing::instrument(level = "info", skip(self, state))]

@@ -62,7 +62,7 @@ pub async fn list(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use sea_orm::{DatabaseBackend, MockDatabase, Transaction};
 
     use crate::config::Config;
@@ -70,12 +70,18 @@ mod tests {
 
     use super::*;
 
-    fn get_role_mock(id: String) -> role::Model {
+    pub(crate) fn get_role_mock<I>(id: I) -> role::Model
+    where
+        I: AsRef<str>,
+    {
+        let id_str = id.as_ref();
+
         role::Model {
-            id: id.clone(),
+            id: id_str.to_string(),
             domain_id: "foo_domain".into(),
             name: "foo".into(),
-            ..Default::default()
+            description: None,
+            extra: None,
         }
     }
 
@@ -85,7 +91,7 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([
                 // First query result - select user itself
-                vec![get_role_mock("1".into())],
+                vec![get_role_mock("1")],
             ])
             .into_connection();
         let config = Config::default();
@@ -116,15 +122,15 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([
                 // First query result - select user itself
-                vec![get_role_mock("1".into())],
+                vec![get_role_mock("1")],
             ])
             .append_query_results([
                 // First query result - select user itself
-                vec![get_role_mock("1".into())],
+                vec![get_role_mock("1")],
             ])
             .append_query_results([
                 // First query result - select user itself
-                vec![get_role_mock("1".into())],
+                vec![get_role_mock("1")],
             ])
             .into_connection();
         let config = Config::default();
