@@ -55,7 +55,6 @@ impl AssignmentBackend for SqlBackend {
         state: &ServiceState,
         params: &RoleListParameters,
     ) -> Result<Vec<Role>, AssignmentProviderError> {
-        // Ok(role::ge)
         Ok(role::list(&self.config, &state.db, params).await?)
     }
 

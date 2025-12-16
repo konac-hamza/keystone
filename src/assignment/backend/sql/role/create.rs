@@ -15,6 +15,7 @@
 use sea_orm::DatabaseConnection;
 use sea_orm::entity::*;
 use serde_json::json;
+use uuid::Uuid;
 
 use crate::assignment::backend::error::{AssignmentDatabaseError, db_err};
 use crate::assignment::types::role::{Role, RoleCreate};
@@ -25,11 +26,11 @@ pub async fn create(
     db: &DatabaseConnection,
     role: RoleCreate, // ← Using RoleCreate instead of Role
 ) -> Result<Role, AssignmentDatabaseError> {
-    let role_id = role.id.as_ref().ok_or_else(|| {
-        AssignmentDatabaseError::InvalidAssignmentType(
-            "BUG: Role ID must be set by provider before calling backend".to_string(),
-        )
-    })?;
+    // Use provided ID or generate a new UUID as fallback
+    let role_id = role
+        .id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
 
     let entry = db_role::ActiveModel {
         id: Set(role_id.clone()),

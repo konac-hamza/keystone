@@ -46,6 +46,7 @@
 //! interprets the user role set, and determines to which operations or
 //! resources each role grants access.
 use async_trait::async_trait;
+use uuid::Uuid;
 use validator::Validate;
 
 pub mod backend;
@@ -134,7 +135,7 @@ impl AssignmentApi for AssignmentProvider {
         let mut new_params = params;
 
         if new_params.id.is_none() {
-            new_params.id = Some(uuid::Uuid::new_v4().to_string());
+            new_params.id = Some(Uuid::new_v4().simple().to_string());
         }
         self.backend_driver.create_role(state, new_params).await
     }
