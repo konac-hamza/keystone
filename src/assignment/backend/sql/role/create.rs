@@ -27,13 +27,11 @@ pub async fn create(
     role: RoleCreate, // ← Using RoleCreate instead of Role
 ) -> Result<Role, AssignmentDatabaseError> {
     // Use provided ID or generate a new UUID as fallback
-    let role_id = role
-        .id
-        .clone()
-        .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
-
     let entry = db_role::ActiveModel {
-        id: Set(role_id.clone()),
+        id: Set(role
+            .id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().simple().to_string())),
         name: Set(role.name.clone()),
         domain_id: Set(role
             .domain_id
