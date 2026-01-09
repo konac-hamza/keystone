@@ -218,7 +218,7 @@ impl From<CatalogProviderError> for KeystoneApiError {
 impl From<IdentityProviderError> for KeystoneApiError {
     fn from(value: IdentityProviderError) -> Self {
         match value {
-            IdentityProviderError::AuthenticationInfo { source } => source.into(),
+            IdentityProviderError::Authentication { source } => source.into(),
             IdentityProviderError::UserNotFound(x) => Self::NotFound {
                 resource: "user".into(),
                 identifier: x,

@@ -41,7 +41,7 @@ pub enum KeystoneError {
 
     /// Assignment provider.
     #[error(transparent)]
-    AssignmentError {
+    AssignmentProvider {
         /// The source of the error.
         #[from]
         source: AssignmentProviderError,
@@ -49,7 +49,7 @@ pub enum KeystoneError {
 
     /// Catalog provider.
     #[error(transparent)]
-    CatalogError {
+    CatalogProvider {
         /// The source of the error.
         #[from]
         source: CatalogProviderError,
@@ -57,7 +57,7 @@ pub enum KeystoneError {
 
     /// Federation provider.
     #[error(transparent)]
-    FederationError {
+    FederationProvider {
         /// The source of the error.
         #[from]
         source: FederationProviderError,
@@ -65,7 +65,7 @@ pub enum KeystoneError {
 
     /// Identity provider.
     #[error(transparent)]
-    IdentityError {
+    IdentityProvider {
         /// The source of the error.
         #[from]
         source: IdentityProviderError,
@@ -73,7 +73,7 @@ pub enum KeystoneError {
 
     /// Identity mapping provider.
     #[error(transparent)]
-    IdentityMappingError {
+    IdentityMapping {
         /// The source of the error.
         #[from]
         source: IdentityMappingError,
@@ -89,7 +89,7 @@ pub enum KeystoneError {
 
     /// Json serialization error.
     #[error("json serde error: {}", source)]
-    JsonError {
+    Json {
         /// The source of the error.
         #[from]
         source: serde_json::Error,
@@ -109,7 +109,7 @@ pub enum KeystoneError {
 
     /// Resource provider.
     #[error(transparent)]
-    ResourceError {
+    ResourceProvider {
         /// The source of the error.
         #[from]
         source: ResourceProviderError,
@@ -167,12 +167,12 @@ pub enum BuilderError {
     UninitializedField(String),
     /// Custom validation error
     #[error("{0}")]
-    ValidationError(String),
+    Validation(String),
 }
 
 impl From<String> for BuilderError {
     fn from(s: String) -> Self {
-        Self::ValidationError(s)
+        Self::Validation(s)
     }
 }
 

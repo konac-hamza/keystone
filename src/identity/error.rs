@@ -24,7 +24,7 @@ use crate::resource::error::ResourceProviderError;
 pub enum IdentityProviderError {
     /// Authentication error.
     #[error(transparent)]
-    AuthenticationInfo {
+    Authentication {
         #[from]
         source: crate::auth::AuthenticationError,
     },
@@ -110,12 +110,10 @@ impl From<IdentityDatabaseError> for IdentityProviderError {
             IdentityDatabaseError::Serde { source } => Self::Serde { source },
             IdentityDatabaseError::StructBuilder { source } => Self::StructBuilder { source },
             IdentityDatabaseError::PasswordHash { source } => Self::PasswordHash { source },
-            IdentityDatabaseError::NoPasswordHash(..) => Self::AuthenticationInfo {
+            IdentityDatabaseError::NoPasswordHash(..) => Self::Authentication {
                 source: crate::auth::AuthenticationError::UserNameOrPasswordWrong,
             },
-            IdentityDatabaseError::AuthenticationInfo { source } => {
-                Self::AuthenticationInfo { source }
-            }
+            IdentityDatabaseError::AuthenticationInfo { source } => Self::Authentication { source },
             _ => Self::Backend { source },
         }
     }

@@ -57,9 +57,11 @@ pub enum TokenProviderError {
     #[error("audit_id must be urlsafe base64 encoded value")]
     AuditIdWrongFormat,
 
+    /// Authentication error.
     #[error(transparent)]
-    AuthenticationInfo(#[from] crate::auth::AuthenticationError),
+    Authentication(#[from] crate::auth::AuthenticationError),
 
+    /// Base64 Decode error.
     #[error("b64 decryption error")]
     Base64Decode(#[from] base64::DecodeError),
 
@@ -79,10 +81,11 @@ pub enum TokenProviderError {
     #[error("token expired")]
     Expired,
 
-    /// Expired token
+    /// Expiry calculation error
     #[error("token expiry calculation failed")]
     ExpiryCalculation,
 
+    /// Federated payload missing data error.
     #[error("federated payload must contain idp_id and protocol_id")]
     FederatedPayloadMissingData,
 
@@ -103,6 +106,7 @@ pub enum TokenProviderError {
     #[error("no usable fernet keys has been found")]
     FernetKeysMissing,
 
+    /// Identity provider error.
     #[error(transparent)]
     IdentityProvider(#[from] crate::identity::error::IdentityProviderError),
 
@@ -113,7 +117,7 @@ pub enum TokenProviderError {
     /// Unsupported token version
     #[error("token version {0} is not supported")]
     InvalidTokenType(u8),
-    ///
+
     /// Unsupported token uuid
     #[error("token uuid is not supported")]
     InvalidTokenUuid,
@@ -147,9 +151,11 @@ pub enum TokenProviderError {
     #[error("project disabled")]
     ProjectDisabled(String),
 
+    /// Resource provider error.
     #[error(transparent)]
     ResourceProvider(#[from] crate::resource::error::ResourceProviderError),
 
+    /// Restricted token project scoped error.
     #[error("token with restrictions can be only project scoped")]
     RestrictedTokenNotProjectScoped,
 
@@ -186,13 +192,15 @@ pub enum TokenProviderError {
         source: std::num::TryFromIntError,
     },
 
+    /// Token restriction not found error.
     #[error("token restriction {0} not found")]
     TokenRestrictionNotFound(String),
 
-    /// Revoked token
+    /// Revoked token error.
     #[error("token has been revoked")]
     TokenRevoked,
 
+    /// Integer parse error.
     #[error("int parse")]
     TryFromIntError(#[from] TryFromIntError),
 
@@ -204,15 +212,19 @@ pub enum TokenProviderError {
     #[error("user disabled")]
     UserDisabled(String),
 
+    /// The user cannot be found error.
     #[error("user cannot be found: {0}")]
     UserNotFound(String),
 
+    /// Unsupported authentication methods in token payload error.
     #[error("unsupported authentication methods {0} in token payload")]
     UnsupportedAuthMethods(String),
 
+    /// UUID decryption error.
     #[error("uuid decryption error")]
     Uuid(#[from] uuid::Error),
 
+    /// Validation error.
     #[error("Token validation error: {0}")]
     Validation(#[from] validator::ValidationErrors),
 }
