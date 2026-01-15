@@ -218,7 +218,7 @@ impl From<CatalogProviderError> for KeystoneApiError {
 impl From<IdentityProviderError> for KeystoneApiError {
     fn from(value: IdentityProviderError) -> Self {
         match value {
-            IdentityProviderError::AuthenticationInfo { source } => source.into(),
+            IdentityProviderError::Authentication { source } => source.into(),
             IdentityProviderError::UserNotFound(x) => Self::NotFound {
                 resource: "user".into(),
                 identifier: x,
@@ -257,7 +257,7 @@ impl From<RevokeProviderError> for KeystoneApiError {
 impl From<TokenProviderError> for KeystoneApiError {
     fn from(value: TokenProviderError) -> Self {
         match value {
-            TokenProviderError::AuthenticationInfo(source) => source.into(),
+            TokenProviderError::Authentication(source) => source.into(),
             TokenProviderError::DomainDisabled(x) => Self::NotFound {
                 resource: "domain".into(),
                 identifier: x,
