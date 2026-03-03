@@ -2,27 +2,64 @@
 FROM rust:1.93.1-slim-trixie AS builder
 
 RUN apt update &&\
-    apt install -y openssl libssl-dev libssl3 pkg-config musl-tools musl-dev &&\
+    apt install -y openssl libssl-dev libssl3 pkg-config &&\
     update-ca-certificates
 
-WORKDIR /app
-COPY . .
+WORKDIR /usr/src
+
+RUN mkdir /app
+
+# Create blank project
+RUN USER=root cargo new keystone
+
+# We want dependencies cached, so copy those first.
+COPY Cargo.toml Cargo.lock /usr/src/keystone/
+COPY crates/keystone/Cargo.toml /usr/src/keystone/crates/keystone/
+COPY crates/keystone_api_types/Cargo.toml /usr/src/keystone/crates/keystone_api_types/
+COPY crates/keystone_distributed_storage/Cargo.toml /usr/src/keystone/crates/keystone_distributed_storage/
+COPY tests/federation/Cargo.toml /usr/src/keystone/tests/federation/
+COPY tests/integration/Cargo.toml /usr/src/keystone/tests/integration/
+COPY tests/api/Cargo.toml /usr/src/keystone/tests/api/
+COPY tests/loadtest/Cargo.toml /usr/src/keystone/tests/loadtest/
+RUN mkdir -p keystone/crates/keystone/src/bin && touch keystone/crates/keystone/src/lib.rs &&\
+  cp keystone/src/main.rs keystone/crates/keystone/src/bin/keystone.rs &&\
+  cp keystone/src/main.rs keystone/crates/keystone/src/bin/keystone_db.rs &&\
+  mkdir keystone/tests/loadtest/src &&\
+  cp keystone/src/main.rs keystone/tests/loadtest/src/main.rs &&\
+  mkdir keystone/crates/keystone_api_types/src &&\
+  touch keystone/crates/keystone_api_types/src/lib.rs &&\
+  mkdir keystone/crates/keystone_distributed_storage/src &&\
+  touch keystone/crates/keystone_distributed_storage/src/lib.rs
+
+# Set the working directory
+WORKDIR /usr/src/keystone
+
+## This is a dummy build to get the dependencies cached.
+RUN cargo build
+
+COPY crates/keystone_api_types/ /usr/src/keystone/crates/keystone_api_types
+COPY tests ./tests
+
+# RUN touch tests/api/k8s_auth.rs
+
 # Compile the specific functional test file
 RUN cargo test --test api --no-run && \
-    cp $(find target/debug/deps -name "api-*" -type f -executable) /usr/local/bin/test-api
+    cp $(find target/debug/deps -name "api-*" -type f -executable) /app/test-api
+RUN cargo test --test k8s_auth --no-run && \
+    cp $(find target/debug/deps -name "k8s_auth-*" -type f -executable) /app/test-k8s-auth
+
 
 # Stage 2: Package
 FROM debian:trixie-slim AS runtime
 
-LABEL maintainer="Artem Goncharov"
+LABEL org.opencontainers.image.authors="Artem Goncharov"
+LABEL description="Keystone-rs tests"
 
 RUN apt update &&\
     apt install -y ca-certificates openssl libssl-dev libssl3 pkg-config &&\
     update-ca-certificates
 
 WORKDIR /tests
-# You'll need to find the binary path (usually target/debug/deps/my_functional_tests-HASH)
-# In CI, it's often easier to rename it or use a script to find it
-COPY --from=builder /usr/local/bin/test-api /tests/api
+COPY --from=builder /app/test-* /tests/
 
 ENTRYPOINT ["/tests/api"]

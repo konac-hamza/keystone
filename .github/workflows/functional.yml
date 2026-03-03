@@ -48,7 +48,9 @@ jobs:
           toolchain: stable
 
       - name: Install protobuf-compiler
-        run: sudo apt install -y protobuf-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
 
       - name: Build Keystone
         run: cargo build --release
@@ -73,6 +75,13 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - build
+    env:
+      OS_AUTH_URL: http://localhost:8080
+      OS_USERNAME: admin
+      OS_PASSWORD: password
+      OS_USER_DOMAIN_ID: default
+      OS_PROJECT_NAME: admin
+      OS_PROJECT_DOMAIN_ID: default
     services:
       postgres:
         image: postgres:17
@@ -428,7 +437,7 @@ jobs:
       - name: Run tests
         run: |
           # run tests referring to the artifacts metadata file
-          skaffold verify -a build.artifacts
+          skaffold verify -a build.artifacts -v debug
 
       - name: Dump K8 pods
         if: failure()
@@ -437,3 +446,11 @@ jobs:
       - name: Dump K8 pods - extended
         if: failure()
         run: kubectl get pods -o custom-columns="NAMESPACE:.metadata.namespace,POD:.metadata.name,STATUS:.status.phase,CONTAINER:.spec.containers[*].name,IMAGE:.spec.containers[*].image"
+
+      - name: Dump skaffold images
+        if: failure()
+        run: cat build.artifacts
+
+      - name: Dump keystone-rs logs
+        if: failure()
+        run: kubectl logs deployment/keystone-rs -c keystone
