@@ -152,15 +152,15 @@ async fn test_revoke_user_project_grant_auth_impact() -> Result<()> {
                 name: Uuid::new_v4().to_string(),
                 project_id: "project_a".into(),
                 roles: vec![
-                    Role {
+                    RoleRef {
                         id: "role_revoke_auth".into(),
-                        name: "role_revoke_auth".into(),
-                        ..Default::default()
+                        domain_id: None,
+                        name: Some("role_exist_auth".into()),
                     },
-                    Role {
+                    RoleRef {
                         id: "role_exist_auth".into(),
-                        name: "role_exist_auth".into(),
-                        ..Default::default()
+                        name: Some("role_exist_auth".into()),
+                        domain_id: None,
                     },
                 ],
                 user_id: user.id.clone(),
@@ -203,6 +203,7 @@ async fn test_revoke_user_project_grant_auth_impact() -> Result<()> {
             .is_ok(),
         "Token should be valid before revocation"
     );
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     // --- Revoke the grant ---
     state
@@ -216,6 +217,7 @@ async fn test_revoke_user_project_grant_auth_impact() -> Result<()> {
         !grant_exists(&state, &user.id, "project_a", "role_revoke_auth", true).await?,
         "Grant should not exist after revocation"
     );
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     // CHECK 2: new auth does not obtain the role
     let post_revoke_token = state.provider.get_token_provider().issue_token(
@@ -239,7 +241,9 @@ async fn test_revoke_user_project_grant_auth_impact() -> Result<()> {
         .validate_token(&state, &post_revoke_encoded, None, None)
         .await?;
 
-    let roles = validated.roles().expect("Token should have roles");
+    let roles = validated
+        .effective_roles()
+        .expect("Token should have effective roles");
 
     assert!(roles.iter().any(|r| r.id == "role_exist_auth"));
     assert!(!roles.iter().any(|r| r.id == "role_revoke_auth"));
