@@ -203,7 +203,6 @@ async fn test_revoke_user_project_grant_auth_impact() -> Result<()> {
             .is_ok(),
         "Token should be valid before revocation"
     );
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     // --- Revoke the grant ---
     state
@@ -217,6 +216,8 @@ async fn test_revoke_user_project_grant_auth_impact() -> Result<()> {
         !grant_exists(&state, &user.id, "project_a", "role_revoke_auth", true).await?,
         "Grant should not exist after revocation"
     );
+
+    // token revocation is working with a seconds precision we need to wait for a new second before granting new token to prevent it being also eventually revoked
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     // CHECK 2: new auth does not obtain the role
