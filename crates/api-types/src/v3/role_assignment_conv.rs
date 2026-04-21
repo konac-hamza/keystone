@@ -104,6 +104,15 @@ impl TryFrom<api_types::RoleAssignmentListParameters>
     }
 }
 
+impl From<provider_types::Assignment> for api_types::Role {
+    fn from(value: provider_types::Assignment) -> Self {
+        api_types::Role {
+            id: value.role_id,
+            name: value.role_name,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::v3::role_assignment::*;
