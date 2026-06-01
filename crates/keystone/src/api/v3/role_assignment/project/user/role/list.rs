@@ -62,13 +62,24 @@ pub(super) async fn list(
     Path((project_id, user_id)): Path<(String, String)>,
     State(state): State<ServiceState>,
 ) -> Result<impl IntoResponse, KeystoneApiError> {
+    state
+        .policy_enforcer
+        .enforce(
+            "identity/project/user/role/list",
+            &user_auth,
+            json!({"project_id": project_id, "user_id": user_id}),
+            None,
+        )
+        .await?;
+
     let query_params = RoleAssignmentListParameters {
         user_id: Some(user_id.clone()),
         project_id: Some(project_id.clone()),
-        effective: Some(true),
+        effective: Some(false),
         include_names: Some(false),
         ..Default::default()
     };
+
     // Use join instead of try_join to have more constant latency preventing timing
     // attacks.
     let (user, project, assignments) = tokio::join!(
@@ -85,31 +96,21 @@ pub(super) async fn list(
             .get_assignment_provider()
             .list_role_assignments(&state, &query_params)
     );
-    let user = user?.ok_or_else(|| {
+    user?.ok_or_else(|| {
         info!("User {} was not found", user_id);
         KeystoneApiError::NotFound {
             resource: "grant".into(),
             identifier: "".into(),
         }
     })?;
-    let project = project?.ok_or_else(|| {
+
+    project?.ok_or_else(|| {
         info!("Project {} was not found", project_id);
         KeystoneApiError::NotFound {
             resource: "grant".into(),
             identifier: "".into(),
         }
     })?;
-    state
-        .policy_enforcer
-        .enforce(
-            "identity/project/user/role/list",
-            &user_auth,
-            json!({"user": user,  "project": project}),
-            None,
-        )
-        .await?;
-
-    // let grants: Vec<Assignment> = assignments?.into_iter().collect();
 
     let roles: Vec<Role> = assignments?
         .into_iter()
@@ -133,7 +134,7 @@ mod tests {
     use openstack_keystone_core_types::identity::*;
     use openstack_keystone_core_types::resource::*;
 
-    use crate::api::tests::get_mocked_state;
+    use crate::api::tests::{get_mocked_state, test_fixture_scoped};
     use crate::api::v3::role_assignment::openapi_router;
     use crate::assignment::MockAssignmentProvider;
     use crate::identity::MockIdentityProvider;
@@ -173,7 +174,7 @@ mod tests {
             .withf(|_, params: &RoleAssignmentListParameters| {
                 params.user_id.as_deref() == Some("user_id")
                     && params.project_id.as_deref() == Some("project_id")
-                    && params.effective == Some(true)
+                    && params.effective == Some(false)
                     && params.include_names == Some(false)
             })
             .returning(|_, _| Ok(vec![]));
@@ -196,9 +197,10 @@ mod tests {
                 .mock_assignment(assignment_mock),
             true,
             None,
-            None,
         )
         .await;
+
+        let vsc = test_fixture_scoped();
 
         let response = openapi_router()
             .layer(TraceLayer::new_for_http())
@@ -208,7 +210,7 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri("/projects/project_id/users/user_id/roles")
-                    .header("x-auth-token", "foo")
+                    .extension(vsc)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -226,7 +228,6 @@ mod tests {
 
         user_mock(&mut identity_mock);
         project_mock(&mut resource_mock);
-        // join! fetches assignments before policy enforcement — mock is required
         assignment_mock_empty(&mut assignment_mock);
 
         let state = get_mocked_state(
@@ -236,9 +237,10 @@ mod tests {
                 .mock_assignment(assignment_mock),
             false, // policy denies
             None,
-            None,
         )
         .await;
+
+        let vsc = test_fixture_scoped();
 
         let response = openapi_router()
             .layer(TraceLayer::new_for_http())
@@ -248,7 +250,7 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri("/projects/project_id/users/user_id/roles")
-                    .header("x-auth-token", "foo")
+                    .extension(vsc)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -260,7 +262,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_unauthorized() {
-        let state = get_mocked_state(Provider::mocked_builder(), true, None, None).await;
+        let state = get_mocked_state(Provider::mocked_builder(), true, None).await;
 
         let response = openapi_router()
             .layer(TraceLayer::new_for_http())
@@ -270,7 +272,7 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri("/projects/project_id/users/user_id/roles")
-                    // no x-auth-token header
+                    // no extension = no auth context = 401
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -287,7 +289,7 @@ mod tests {
         identity_mock
             .expect_get_user()
             .withf(|_, id: &'_ str| id == "user_id")
-            .returning(|_, _| Ok(None)); // user not found
+            .returning(|_, _| Ok(None));
 
         let mut resource_mock = MockResourceProvider::default();
         project_mock(&mut resource_mock);
@@ -302,9 +304,10 @@ mod tests {
                 .mock_assignment(assignment_mock),
             true,
             None,
-            None,
         )
         .await;
+
+        let vsc = test_fixture_scoped();
 
         let response = openapi_router()
             .layer(TraceLayer::new_for_http())
@@ -314,7 +317,7 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri("/projects/project_id/users/user_id/roles")
-                    .header("x-auth-token", "foo")
+                    .extension(vsc)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -334,7 +337,7 @@ mod tests {
         resource_mock
             .expect_get_project()
             .withf(|_, pid: &'_ str| pid == "project_id")
-            .returning(|_, _| Ok(None)); // project not found
+            .returning(|_, _| Ok(None));
 
         let mut assignment_mock = MockAssignmentProvider::default();
         assignment_mock_empty(&mut assignment_mock);
@@ -346,9 +349,10 @@ mod tests {
                 .mock_assignment(assignment_mock),
             true,
             None,
-            None,
         )
         .await;
+
+        let vsc = test_fixture_scoped();
 
         let response = openapi_router()
             .layer(TraceLayer::new_for_http())
@@ -358,7 +362,7 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri("/projects/project_id/users/user_id/roles")
-                    .header("x-auth-token", "foo")
+                    .extension(vsc)
                     .body(Body::empty())
                     .unwrap(),
             )
