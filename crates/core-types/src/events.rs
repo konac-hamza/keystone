@@ -88,6 +88,10 @@ pub enum EventPayload {
         id: String,
         project_id: String,
     },
+    AccessRule {
+        id: String,
+        user_id: String,
+    },
 
     // Catalog
     Endpoint {

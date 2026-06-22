@@ -24,6 +24,7 @@ use crate::entity::{
     application_credential_role as db_application_credential_role,
 };
 
+pub mod access_rule;
 mod create;
 mod get;
 mod list;
@@ -146,6 +147,7 @@ impl TryFrom<db_access_rule::Model> for AccessRule {
             path: value.path.clone(),
             service: value.service.clone(),
             method: value.method.clone(),
+            user_id: value.user_id.clone().unwrap_or_default(),
         })
     }
 }
@@ -222,7 +224,7 @@ pub(crate) mod tests {
             path: Some("/path".into()),
             method: Some("method".into()),
             service: Some("service".into()),
-            user_id: None,
+            user_id: Some("user_id".into()),
         }
     }
 }

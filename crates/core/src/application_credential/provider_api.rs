@@ -21,6 +21,21 @@ use openstack_keystone_core_types::application_credential::*;
 /// Application credentials API.
 #[async_trait]
 pub trait ApplicationCredentialApi: Send + Sync {
+    /// Create a standalone access rule owned by a user.
+    ///
+    /// # Parameters
+    /// - `state`: The current service state.
+    /// - `rule`: The access rule to create (its `user_id` identifies the owner).
+    ///
+    /// # Returns
+    /// - `Result<AccessRule, ApplicationCredentialProviderError>` - The created
+    ///   access rule or an error.
+    async fn create_access_rule(
+        &self,
+        state: &ServiceState,
+        rule: AccessRuleCreate,
+    ) -> Result<AccessRule, ApplicationCredentialProviderError>;
+
     /// Create a new application credential.
     ///
     /// # Parameters
@@ -37,6 +52,40 @@ pub trait ApplicationCredentialApi: Send + Sync {
         rec: ApplicationCredentialCreate,
     ) -> Result<ApplicationCredentialCreateResponse, ApplicationCredentialProviderError>;
 
+    /// Delete a user's access rule by its ID.
+    ///
+    /// # Parameters
+    /// - `state`: The current service state.
+    /// - `user_id`: The ID of the user owning the access rule.
+    /// - `id`: The ID of the access rule.
+    ///
+    /// # Returns
+    /// - `Result<(), ApplicationCredentialProviderError>` - Unit on success, or
+    ///   an error.
+    async fn delete_access_rule<'a>(
+        &self,
+        state: &ServiceState,
+        user_id: &'a str,
+        id: &'a str,
+    ) -> Result<(), ApplicationCredentialProviderError>;
+
+    /// Get a user's access rule by its ID.
+    ///
+    /// # Parameters
+    /// - `state`: The current service state.
+    /// - `user_id`: The ID of the user owning the access rule.
+    /// - `id`: The ID of the access rule.
+    ///
+    /// # Returns
+    /// - `Result<Option<AccessRule>, ApplicationCredentialProviderError>` - The
+    ///   access rule if found, or an error.
+    async fn get_access_rule<'a>(
+        &self,
+        state: &ServiceState,
+        user_id: &'a str,
+        id: &'a str,
+    ) -> Result<Option<AccessRule>, ApplicationCredentialProviderError>;
+
     /// Get a single application credential by ID.
     ///
     /// # Parameters
@@ -52,6 +101,21 @@ pub trait ApplicationCredentialApi: Send + Sync {
         state: &ServiceState,
         id: &'a str,
     ) -> Result<Option<ApplicationCredential>, ApplicationCredentialProviderError>;
+
+    /// List all access rules owned by a user.
+    ///
+    /// # Parameters
+    /// - `state`: The current service state.
+    /// - `user_id`: The ID of the user owning the access rules.
+    ///
+    /// # Returns
+    /// - `Result<Vec<AccessRule>, ApplicationCredentialProviderError>` - A list
+    ///   of access rules or an error.
+    async fn list_access_rules<'a>(
+        &self,
+        state: &ServiceState,
+        user_id: &'a str,
+    ) -> Result<Vec<AccessRule>, ApplicationCredentialProviderError>;
 
     /// List application credentials.
     ///

@@ -25,17 +25,43 @@ mock! {
     #[async_trait]
     impl ApplicationCredentialApi for ApplicationCredentialProvider {
 
+        async fn create_access_rule(
+            &self,
+            state: &ServiceState,
+            rule: AccessRuleCreate,
+        ) -> Result<AccessRule, ApplicationCredentialProviderError>;
+
         async fn create_application_credential(
             &self,
             state: &ServiceState,
             rec: ApplicationCredentialCreate,
         ) -> Result<ApplicationCredentialCreateResponse, ApplicationCredentialProviderError>;
 
+        async fn delete_access_rule<'a>(
+            &self,
+            state: &ServiceState,
+            user_id: &'a str,
+            id: &'a str,
+        ) -> Result<(), ApplicationCredentialProviderError>;
+
+        async fn get_access_rule<'a>(
+            &self,
+            state: &ServiceState,
+            user_id: &'a str,
+            id: &'a str,
+        ) -> Result<Option<AccessRule>, ApplicationCredentialProviderError>;
+
         async fn get_application_credential<'a>(
             &self,
             state: &ServiceState,
             id: &'a str,
         ) -> Result<Option<ApplicationCredential>, ApplicationCredentialProviderError>;
+
+        async fn list_access_rules<'a>(
+            &self,
+            state: &ServiceState,
+            user_id: &'a str,
+        ) -> Result<Vec<AccessRule>, ApplicationCredentialProviderError>;
 
         async fn list_application_credentials(
             &self,
