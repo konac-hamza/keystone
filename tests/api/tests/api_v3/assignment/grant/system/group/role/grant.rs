@@ -22,9 +22,9 @@ use openstack_keystone_api_types::v3::group::GroupCreateBuilder;
 use openstack_sdk::{AsyncOpenStack, config::CloudConfig};
 
 use super::*;
-use crate::guard::*;
-use crate::identity::group::*;
-use crate::role::list_roles;
+use test_api::guard::*;
+use test_api::identity::group::*;
+use test_api::role::list_roles;
 
 #[tokio::test]
 #[traced_test]
