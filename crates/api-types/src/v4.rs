@@ -14,6 +14,7 @@
 //! # V4 API types
 pub mod auth;
 pub mod mapping;
+pub mod project;
 pub mod token_restriction;
 pub mod user;
 

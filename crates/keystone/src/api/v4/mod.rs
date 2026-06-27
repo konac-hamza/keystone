@@ -31,6 +31,7 @@ use crate::keystone::ServiceState;
 pub mod auth;
 pub mod group;
 pub mod mapping;
+pub mod project;
 pub mod role;
 pub mod role_assignment;
 pub mod token;

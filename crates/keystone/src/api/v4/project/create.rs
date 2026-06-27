@@ -27,6 +27,7 @@ use crate::api::v3::project::types::ProjectResponse;
 use crate::api::v4::project::types::ProjectCreateRequest;
 use crate::keystone::ServiceState;
 use crate::resource::ResourceApi;
+use openstack_keystone_core::auth::ExecutionContext;
 
 /// Create project.
 ///
@@ -66,7 +67,10 @@ pub(super) async fn create(
     let created_project = state
         .provider
         .get_resource_provider()
-        .create_project(&state, payload.project.into())
+        .create_project(
+            &ExecutionContext::from_auth(&state, &user_auth),
+            payload.project.into(),
+        )
         .await?;
 
     // Return response with 201 CREATED status
@@ -387,5 +391,41 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_invalid_chars_id_rejected() {
+        let vsc = test_fixture_scoped();
+        let state = get_mocked_state(Provider::mocked_builder(), true, None).await;
+
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state.clone());
+
+        let req = ProjectCreateRequest {
+            project: ProjectCreateBuilder::default()
+                .name("name")
+                .domain_id("did")
+                .id("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz") // 32 chars, invalid hex
+                .build()
+                .unwrap(),
+        };
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .extension(vsc)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .method("POST")
+                    .body(Body::from(serde_json::to_string(&req).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

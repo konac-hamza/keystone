@@ -113,13 +113,11 @@ pub struct ProjectCreateRequest {
 // The Validator that check format of the project id if it given by user.
 #[cfg(feature = "validate")]
 fn validate_uuid(id: &str) -> Result<(), ValidationError> {
-    // Dashless UUIDs must be exactly 32 hex characters, no hyphens
-    let is_dashless = id.len() == 32 && !id.contains('-');
+    let parsed = Uuid::parse_str(id).map_err(|_| ValidationError::new("invalid_uuid"))?;
 
-    if !is_dashless {
+    if parsed.simple().to_string() != id {
         return Err(ValidationError::new("invalid_uuid_format"));
     }
 
-    Uuid::parse_str(id).map_err(|_| ValidationError::new("invalid_uuid"))?;
     Ok(())
 }
