@@ -36,7 +36,7 @@ pub struct ApiDoc;
 pub(crate) fn openapi_router() -> OpenApiRouter<ServiceState> {
     OpenApiRouter::new()
         .routes(routes!(create::create))
-        .routes(routes!(delete::remove))
+        // .routes(routes!(delete::remove))
         .routes(routes!(list::list))
         .routes(routes!(show::show))
 }

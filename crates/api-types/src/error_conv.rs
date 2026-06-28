@@ -596,6 +596,40 @@ impl From<KeystoneError> for KeystoneApiError {
     }
 }
 
+impl From<ApplicationCredentialProviderError> for KeystoneApiError {
+    fn from(value: ApplicationCredentialProviderError) -> Self {
+        match value {
+            ApplicationCredentialProviderError::ApplicationCredentialNotFound(x) => {
+                Self::NotFound {
+                    resource: "application_credential".into(),
+                    identifier: x,
+                }
+            }
+            ApplicationCredentialProviderError::AccessRuleNotFound(x) => Self::NotFound {
+                resource: "access_rule".into(),
+                identifier: x,
+            },
+            ApplicationCredentialProviderError::RoleNotFound(x) => Self::NotFound {
+                resource: "role".into(),
+                identifier: x,
+            },
+            ref err @ ApplicationCredentialProviderError::Conflict(..) => {
+                Self::Conflict(err.to_string())
+            }
+            ref err @ ApplicationCredentialProviderError::Validation { .. } => {
+                Self::BadRequest(err.to_string())
+            }
+            ApplicationCredentialProviderError::ApplicationCredentialExpired => {
+                Self::BadRequest("application credential has expired".into())
+            }
+            ApplicationCredentialProviderError::AccessRuleInUse(x) => {
+                Self::BadRequest(format!("access rule {x} is still in use"))
+            }
+            other => Self::InternalError(other.to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
