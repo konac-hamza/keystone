@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "validate")]
 use validator::Validate;
 
-use crate::role::RoleRef;
+use crate::v3::application_credential::access_rule::{AccessRule, AccessRuleCreate};
+use crate::v3::role::RoleRef;
 
 /// Full application credential representation.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -125,6 +126,40 @@ pub struct ApplicationCredentialCreateRequest {
     pub application_credential: ApplicationCredentialCreate,
 }
 
+/// Application credential as returned by create — includes secret (shown once only).
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "validate", derive(validator::Validate))]
+pub struct ApplicationCredentialCreated {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_rules: Option<Vec<AccessRule>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+
+    pub id: String,
+    pub name: String,
+    pub project_id: String,
+    pub roles: Vec<RoleRef>,
+
+    /// Only present in create response. Never returned again.
+    pub secret: String,
+
+    pub unrestricted: bool,
+    pub user_id: String,
+}
+
+/// Wrapper for create response body.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "validate", derive(validator::Validate))]
+pub struct ApplicationCredentialCreateResponse {
+    pub application_credential: ApplicationCredentialCreated,
+}
+
 /// List of application credentials.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -141,8 +176,4 @@ pub struct ApplicationCredentialList {
 pub struct ApplicationCredentialListParameters {
     #[cfg_attr(feature = "validate", validate(length(max = 255)))]
     pub name: Option<String>,
-
-    pub limit: Option<u64>,
-
-    pub marker: Option<String>,
 }
