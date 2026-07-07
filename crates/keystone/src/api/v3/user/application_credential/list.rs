@@ -26,7 +26,6 @@ use super::types::application_credential::{
 };
 use crate::api::auth::Auth;
 use crate::api::error::KeystoneApiError;
-use crate::identity::IdentityApi;
 use crate::keystone::ServiceState;
 use openstack_keystone_core::auth::ExecutionContext;
 
@@ -61,20 +60,20 @@ pub(super) async fn list(
     state
         .policy_enforcer
         .enforce(
-            "identity/application_credential/list",
+            "identity/user/application_credential/list",
             &user_auth,
             json!({"user_id": user_id}),
             None,
         )
         .await?;
 
+    // Set the user_id in the payload to ensure the list is scoped to the correct user
+    let mut filter: openstack_keystone_core_types::application_credential::ApplicationCredentialListParameters = payload.into();
+    filter.user_id = user_id.clone();
     let application_credentials = state
         .provider
         .get_application_credential_provider()
-        .list_application_credentials(
-            &ExecutionContext::from_auth(&state, &user_auth),
-            &payload.into(),
-        )
+        .list_application_credentials(&ExecutionContext::from_auth(&state, &user_auth), &filter)
         .await
         .map_err(KeystoneApiError::from)?;
 

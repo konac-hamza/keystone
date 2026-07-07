@@ -15,7 +15,6 @@ use secrecy::ExposeSecret;
 
 use openstack_keystone_core_types::application_credential as provider_types;
 
-use crate::v3 as api_types;
 use crate::v3::application_credential::access_rule as api_types_access_rule;
 use crate::v3::application_credential::application_credential as api_types_application_credential;
 
