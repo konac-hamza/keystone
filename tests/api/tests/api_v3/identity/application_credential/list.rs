@@ -2,13 +2,11 @@ use eyre::Result;
 use openstack_keystone_api_types::v3::application_credential::application_credential::*;
 use openstack_sdk::{AsyncOpenStack, config::CloudConfig};
 use std::sync::Arc;
-use test_api::auth::project::list_auth_projects;
 use test_api::guard::ResourceGuard;
 use test_api::identity::application_credential::{
     create_application_credential, list_application_credentials,
 };
 use tracing_test::traced_test;
-use uuid::Uuid;
 
 pub async fn get_project_scoped_client() -> Result<Arc<AsyncOpenStack>> {
     let mut tc = AsyncOpenStack::new(&CloudConfig::from_env()?).await?;
@@ -47,7 +45,7 @@ async fn test_list() -> Result<()> {
         &tc,
         &user_id,
         ApplicationCredentialCreateBuilder::default()
-            .name(format!("cred-1-{}", Uuid::new_v4().simple()))
+            .name(format!("cred-1"))
             .roles(vec![])
             .build()?,
     )
@@ -57,7 +55,7 @@ async fn test_list() -> Result<()> {
         &tc,
         &user_id,
         ApplicationCredentialCreateBuilder::default()
-            .name(format!("cred-2-{}", Uuid::new_v4().simple()))
+            .name(format!("cred-2"))
             .roles(vec![])
             .build()?,
     )
