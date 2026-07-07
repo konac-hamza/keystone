@@ -23,7 +23,6 @@ use serde_json::json;
 use super::types::application_credential::ApplicationCredentialResponse;
 use crate::api::auth::Auth;
 use crate::api::error::KeystoneApiError;
-use crate::identity::IdentityApi;
 use crate::keystone::ServiceState;
 use openstack_keystone_core::auth::ExecutionContext;
 
@@ -68,7 +67,7 @@ pub(super) async fn show(
     state
         .policy_enforcer
         .enforce(
-            "identity/application_credential/show",
+            "identity/user/application_credential/show",
             &user_auth,
             json!({"user_id": current.user_id}),
             None,

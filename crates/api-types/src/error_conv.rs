@@ -251,19 +251,33 @@ impl From<CatalogProviderError> for KeystoneApiError {
 }
 
 impl From<ApplicationCredentialProviderError> for KeystoneApiError {
-    fn from(source: ApplicationCredentialProviderError) -> Self {
-        match source {
+    fn from(value: ApplicationCredentialProviderError) -> Self {
+        match value {
             ApplicationCredentialProviderError::ApplicationCredentialNotFound(x) => {
                 Self::NotFound {
                     resource: "application_credential".into(),
                     identifier: x,
                 }
             }
+            ApplicationCredentialProviderError::AccessRuleNotFound(x) => Self::NotFound {
+                resource: "access_rule".into(),
+                identifier: x,
+            },
+            ApplicationCredentialProviderError::RoleNotFound(x) => Self::NotFound {
+                resource: "role".into(),
+                identifier: x,
+            },
             ref err @ ApplicationCredentialProviderError::Conflict(..) => {
                 Self::Conflict(err.to_string())
             }
-            err @ ApplicationCredentialProviderError::ApplicationCredentialExpired => {
-                Self::unauthorized(err, None::<String>)
+            ref err @ ApplicationCredentialProviderError::Validation { .. } => {
+                Self::BadRequest(err.to_string())
+            }
+            ApplicationCredentialProviderError::ApplicationCredentialExpired => {
+                Self::BadRequest("application credential has expired".into())
+            }
+            ApplicationCredentialProviderError::AccessRuleInUse(x) => {
+                Self::BadRequest(format!("access rule {x} is still in use"))
             }
             err @ ApplicationCredentialProviderError::AccessRulesUnenforced => {
                 Self::BadRequest(err.to_string())
@@ -592,40 +606,6 @@ impl From<KeystoneError> for KeystoneApiError {
             KeystoneError::TokenProvider { source } => source.into(),
             KeystoneError::TrustProvider { source } => source.into(),
             _ => KeystoneApiError::internal(value),
-        }
-    }
-}
-
-impl From<ApplicationCredentialProviderError> for KeystoneApiError {
-    fn from(value: ApplicationCredentialProviderError) -> Self {
-        match value {
-            ApplicationCredentialProviderError::ApplicationCredentialNotFound(x) => {
-                Self::NotFound {
-                    resource: "application_credential".into(),
-                    identifier: x,
-                }
-            }
-            ApplicationCredentialProviderError::AccessRuleNotFound(x) => Self::NotFound {
-                resource: "access_rule".into(),
-                identifier: x,
-            },
-            ApplicationCredentialProviderError::RoleNotFound(x) => Self::NotFound {
-                resource: "role".into(),
-                identifier: x,
-            },
-            ref err @ ApplicationCredentialProviderError::Conflict(..) => {
-                Self::Conflict(err.to_string())
-            }
-            ref err @ ApplicationCredentialProviderError::Validation { .. } => {
-                Self::BadRequest(err.to_string())
-            }
-            ApplicationCredentialProviderError::ApplicationCredentialExpired => {
-                Self::BadRequest("application credential has expired".into())
-            }
-            ApplicationCredentialProviderError::AccessRuleInUse(x) => {
-                Self::BadRequest(format!("access rule {x} is still in use"))
-            }
-            other => Self::InternalError(other.to_string()),
         }
     }
 }

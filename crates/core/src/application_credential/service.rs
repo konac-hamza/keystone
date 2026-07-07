@@ -290,6 +290,48 @@ impl ApplicationCredentialApi for ApplicationCredentialService {
         Ok(())
     }
 
+    /// Delete an application credential by ID.
+    ///
+    /// # Parameters
+    /// - `state`: The current service state.
+    /// - `id`: The ID of the application credential to delete.
+    ///
+    /// # Returns
+    /// - `Result<(), ApplicationCredentialProviderError>` - Unit on success, or
+    ///   an error.
+    async fn delete_application_credential<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        id: &'a str,
+    ) -> Result<(), ApplicationCredentialProviderError> {
+        // Fetch first to get project_id for the event — mirrors Python fetching before delete
+        let app_cred = self
+            .backend_driver
+            .get_application_credential(ctx.state(), id)
+            .await?
+            .ok_or_else(|| {
+                ApplicationCredentialProviderError::ApplicationCredentialNotFound(id.to_string())
+            })?;
+
+        let project_id = app_cred.project_id.clone();
+
+        self.backend_driver
+            .delete_application_credential(ctx.state(), id)
+            .await?;
+
+        ctx.state()
+            .event_dispatcher
+            .emit(Event::new(
+                Operation::Delete,
+                EventPayload::ApplicationCredential {
+                    id: id.to_string(),
+                    project_id,
+                },
+            ))
+            .await;
+
+        Ok(())
+    }
     /// Get a user's access rule by its ID.
     ///
     /// # Parameters

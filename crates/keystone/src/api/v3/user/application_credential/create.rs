@@ -26,8 +26,6 @@ use super::types::application_credential::{
 };
 use crate::api::auth::Auth;
 use crate::api::error::KeystoneApiError;
-use crate::application_credential::ApplicationCredentialApi;
-use crate::identity::IdentityApi;
 use crate::keystone::ServiceState;
 use openstack_keystone_core::auth::ExecutionContext;
 use openstack_keystone_core_types::auth::ScopeInfo;
@@ -87,7 +85,7 @@ pub(super) async fn create(
     state
         .policy_enforcer
         .enforce(
-            "identity/application_credential/create",
+            "identity/user/application_credential/create",
             &user_auth,
             json!({"user_id": user_id}),
             None,
