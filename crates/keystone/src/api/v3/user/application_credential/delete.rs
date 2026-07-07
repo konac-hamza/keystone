@@ -40,6 +40,13 @@ pub(super) async fn delete(
     Path((user_id, application_credential_id)): Path<(String, String)>,
     State(state): State<ServiceState>,
 ) -> Result<impl IntoResponse, KeystoneApiError> {
+    state
+        .provider
+        .get_identity_provider()
+        .get_user(&ExecutionContext::from_auth(&state, &user_auth), &user_id)
+        .await?
+        .ok_or_else(|| KeystoneApiError::not_found("user", &user_id))?;
+
     // Fetch credential to get real user_id for policy enforcement
     // Mirrors Python _update_request_user_id_attribute() security fix
     let current = state
