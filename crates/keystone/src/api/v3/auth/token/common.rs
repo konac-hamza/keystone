@@ -47,13 +47,6 @@ pub(super) async fn authenticate_request(
                 .map(|v| (name.as_str().to_string(), v.to_string()))
         })
         .collect();
-    let xff_header = headers
-        .get(axum::http::header::HeaderName::from_static(
-            "x-forwarded-for",
-        ))
-        .and_then(|h| h.to_str().ok())
-        .map(str::to_string);
-
     // Pre-dispatch `route` mode (ADR 0025 §4 "Guest Contract - `route`
     // Mode"): runs once, before any builtin/plugin method dispatch, and may
     // relabel which already-registered method actually handles the request
@@ -101,7 +94,6 @@ pub(super) async fn authenticate_request(
                 &effective_methods,
                 payloads,
                 raw_headers.clone(),
-                xff_header.clone(),
                 peer_ip,
             )
             .await
@@ -200,7 +192,6 @@ pub(super) async fn authenticate_request(
             let wasm_request = WasmPluginAuthRequest {
                 payload: payload.clone(),
                 raw_headers: raw_headers.clone(),
-                xff_header: xff_header.clone(),
                 peer_ip,
             };
             let dispatch_result = match plugin_mode {

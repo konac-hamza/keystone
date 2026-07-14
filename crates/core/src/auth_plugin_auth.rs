@@ -52,10 +52,8 @@ pub struct WasmPluginAuthRequest {
     /// [`HARD_DENYLISTED_HEADERS`]) inside this function, never passed to
     /// the plugin as-is.
     pub raw_headers: HashMap<String, String>,
-    /// `X-Forwarded-For` header value, if present - resolved into a
-    /// trusted client address using `[auth_plugins].trusted_proxies`.
-    pub xff_header: Option<String>,
-    /// Raw TCP peer address.
+    /// Raw public-interface TCP peer address. Internal/admin callers pass
+    /// `None` even when their listener records a peer for audit logging.
     pub peer_ip: Option<std::net::IpAddr>,
 }
 
@@ -121,12 +119,19 @@ pub async fn authenticate_via_wasm_plugin(
         return Err(WasmPluginAuthError::NotFound);
     };
 
-    let trusted_proxies = {
+    let (trusted_proxies, trusted_header) = {
         let cfg = state.config_manager.config.read().await;
-        cfg.auth_plugins.trusted_proxies.clone()
+        (
+            cfg.auth_plugins.trusted_proxies.clone(),
+            cfg.auth_plugins.trusted_header,
+        )
     };
     let remote_addr = resolve_client_ip(
-        request.xff_header.as_deref(),
+        request
+            .raw_headers
+            .get(trusted_header.as_str())
+            .map(String::as_str),
+        trusted_header,
         request.peer_ip,
         &trusted_proxies,
     )
@@ -421,12 +426,19 @@ pub async fn authenticate_via_wasm_mapping_plugin(
         return Err(WasmPluginAuthError::NotFound);
     };
 
-    let trusted_proxies = {
+    let (trusted_proxies, trusted_header) = {
         let cfg = state.config_manager.config.read().await;
-        cfg.auth_plugins.trusted_proxies.clone()
+        (
+            cfg.auth_plugins.trusted_proxies.clone(),
+            cfg.auth_plugins.trusted_header,
+        )
     };
     let remote_addr = resolve_client_ip(
-        request.xff_header.as_deref(),
+        request
+            .raw_headers
+            .get(trusted_header.as_str())
+            .map(String::as_str),
+        trusted_header,
         request.peer_ip,
         &trusted_proxies,
     )
@@ -624,7 +636,6 @@ pub async fn route_via_wasm_plugin(
     methods: &[String],
     payloads: HashMap<String, serde_json::Value>,
     raw_headers: HashMap<String, String>,
-    xff_header: Option<String>,
     peer_ip: Option<std::net::IpAddr>,
 ) -> Result<RouteDecision, WasmPluginAuthError> {
     let registry = state.auth_plugin_registry.read().await.clone();
@@ -653,12 +664,20 @@ pub async fn route_via_wasm_plugin(
         return Err(WasmPluginAuthError::NotFound);
     };
 
-    let trusted_proxies = {
+    let (trusted_proxies, trusted_header) = {
         let cfg = state.config_manager.config.read().await;
-        cfg.auth_plugins.trusted_proxies.clone()
+        (
+            cfg.auth_plugins.trusted_proxies.clone(),
+            cfg.auth_plugins.trusted_header,
+        )
     };
-    let remote_addr = resolve_client_ip(xff_header.as_deref(), peer_ip, &trusted_proxies)
-        .map(|ip| ip.to_string());
+    let remote_addr = resolve_client_ip(
+        raw_headers.get(trusted_header.as_str()).map(String::as_str),
+        trusted_header,
+        peer_ip,
+        &trusted_proxies,
+    )
+    .map(|ip| ip.to_string());
 
     // Independent budget from the target method's own (ADR §7 "Fail-closed,
     // independent budget") - falls out for free since `limiter` is looked
@@ -1056,7 +1075,6 @@ mod acceptance_tests {
         let request = |external_id: &str| WasmPluginAuthRequest {
             payload: serde_json::json!({"external_id": external_id}),
             raw_headers: HashMap::new(),
-            xff_header: None,
             peer_ip: None,
         };
 
@@ -1101,7 +1119,6 @@ mod acceptance_tests {
             WasmPluginAuthRequest {
                 payload: serde_json::json!({"external_id": "mallory", "bad_handle": true}),
                 raw_headers: HashMap::new(),
-                xff_header: None,
                 peer_ip: None,
             },
         )
@@ -1122,7 +1139,6 @@ mod acceptance_tests {
             WasmPluginAuthRequest {
                 payload: serde_json::json!({"external_id": "denied-user", "deny": true}),
                 raw_headers: HashMap::new(),
-                xff_header: None,
                 peer_ip: None,
             },
         )
@@ -1161,7 +1177,6 @@ mod acceptance_tests {
         WasmPluginAuthRequest {
             payload: serde_json::json!({"external_id": external_id}),
             raw_headers: HashMap::new(),
-            xff_header: None,
             peer_ip,
         }
     }
@@ -1190,6 +1205,27 @@ mod acceptance_tests {
             err,
             WasmPluginAuthError::RateLimited("per_source", _)
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_missing_public_peer_bypasses_per_source_limit() {
+        let (identity_mock, dpi_mock) = permissive_mocks();
+        let state = build_state_with_plugins(
+            identity_mock,
+            dpi_mock,
+            &["p"],
+            "invocation_rate_limit_per_source_per_minute = 1\n\
+             invocation_rate_limit_per_minute = 1000\n\
+             max_concurrent_invocations = 1000",
+        )
+        .await;
+
+        authenticate_via_wasm_plugin(&state, "p", request("internal-a", None))
+            .await
+            .expect("first internal call should bypass the public-source bucket");
+        authenticate_via_wasm_plugin(&state, "p", request("internal-b", None))
+            .await
+            .expect("second internal call should not share a mesh-peer bucket");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1542,7 +1578,6 @@ mod mapping_acceptance_tests {
         WasmPluginAuthRequest {
             payload: serde_json::json!({"external_id": external_id, "deny": deny}),
             raw_headers: HashMap::new(),
-            xff_header: None,
             peer_ip: None,
         }
     }
@@ -1855,7 +1890,6 @@ mod route_acceptance_tests {
             appcred_payloads("some-other-shape"),
             HashMap::new(),
             None,
-            None,
         )
         .await
         .expect("passthrough should not error");
@@ -1872,7 +1906,6 @@ mod route_acceptance_tests {
             &["application_credential".to_string()],
             appcred_payloads("tf-abc123"),
             HashMap::new(),
-            None,
             None,
         )
         .await
@@ -1902,7 +1935,6 @@ mod route_acceptance_tests {
             appcred_payloads("tf-abc123"),
             HashMap::new(),
             None,
-            None,
         )
         .await
         .expect_err("an off-allowlist target must be rejected, not redirected");
@@ -1919,7 +1951,6 @@ mod route_acceptance_tests {
             appcred_payloads("deny-me"),
             HashMap::new(),
             None,
-            None,
         )
         .await
         .expect_err("a plugin Deny response must be rejected");
@@ -1935,7 +1966,6 @@ mod route_acceptance_tests {
             WasmPluginAuthRequest {
                 payload: serde_json::json!({"external_id": "alice"}),
                 raw_headers: HashMap::new(),
-                xff_header: None,
                 peer_ip: None,
             },
         )
@@ -1954,7 +1984,6 @@ mod route_acceptance_tests {
             &["password".to_string()],
             HashMap::new(),
             HashMap::new(),
-            None,
             None,
         )
         .await

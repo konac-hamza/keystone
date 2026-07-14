@@ -78,6 +78,7 @@ mod interface;
 mod k8s_auth;
 mod listener;
 mod mapping;
+mod oslo_middleware;
 mod policy;
 mod rate_limit;
 mod resource;
@@ -113,6 +114,7 @@ pub use interface::*;
 pub use k8s_auth::*;
 pub use listener::*;
 pub use mapping::*;
+pub use oslo_middleware::*;
 pub use policy::*;
 pub use rate_limit::*;
 pub use resource::*;
@@ -213,6 +215,10 @@ pub struct Config {
     /// Mapping provider configuration.
     #[serde(default)]
     pub mapping: MappingProvider,
+
+    /// `[oslo_middleware]` configuration (proxy header parsing).
+    #[serde(default)]
+    pub oslo_middleware: OsloMiddleware,
 
     /// Server listener configuration for the internal interface.
     #[serde(rename = "interface_internal", default)]
@@ -866,7 +872,10 @@ mod tests {
         let cfg = Config::load_all(config_file.path().to_path_buf()).unwrap();
         assert_eq!(
             cfg.api_key.trusted_proxies,
-            vec!["10.0.0.0/8".to_string(), "192.168.1.0/24".to_string()]
+            vec![
+                "10.0.0.0/8".parse::<ipnet::IpNet>().unwrap(),
+                "192.168.1.0/24".parse::<ipnet::IpNet>().unwrap()
+            ]
         );
     }
 

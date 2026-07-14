@@ -34,7 +34,8 @@ use tracing::warn;
 use openstack_keystone_config::{Config, RateLimitSection, RateLimitTrustedProxiesSection};
 use openstack_keystone_core_types::error::KeystoneError;
 
-use crate::net::resolve_client_ip_from_nets;
+#[cfg(any(feature = "api", test))]
+use crate::net::resolve_client_ip_from_headers;
 
 /// Allocation-free global-IP bucket key.
 ///
@@ -137,22 +138,26 @@ impl RateLimitState {
 
     /// Check the global per-IP bucket for an inbound request.
     ///
-    /// The effective address is the rightmost non-trusted
-    /// `X-Forwarded-For` hop when the TCP peer is trusted. An absent peer
-    /// identifies an internal/admin interface and bypasses this public-ingress
-    /// limiter.
+    /// The effective address is the rightmost non-trusted hop in the one
+    /// operator-selected forwarding header when the TCP peer is trusted. An
+    /// absent peer identifies an internal/admin interface and bypasses this
+    /// public-ingress limiter.
+    #[cfg(any(feature = "api", test))]
     pub fn check_ip(
         &self,
-        xff_header: Option<&str>,
+        headers: &axum::http::HeaderMap,
         peer_ip: Option<IpAddr>,
     ) -> Result<(), Duration> {
         let snapshot = self.snapshot.load();
         let Some(limiter) = snapshot.global_ip_limiter.as_ref() else {
             return Ok(());
         };
-        let Some(client_ip) =
-            resolve_client_ip_from_nets(xff_header, peer_ip, &snapshot.trusted_proxies)
-        else {
+        let Some(client_ip) = resolve_client_ip_from_headers(
+            headers,
+            peer_ip,
+            &snapshot.trusted_proxies,
+            snapshot.applied_config.trusted_proxies.trusted_header,
+        ) else {
             return Ok(());
         };
 
@@ -220,19 +225,10 @@ fn build_snapshot(config: &Config) -> Result<RateLimitSnapshot, KeystoneError> {
     let applied_config = AppliedRateLimitConfig::from_config(config);
     let global_ip_limiter = build_limiter(&applied_config.global_ip, "rate_limit_global_ip")?;
     let user_auth_limiter = build_limiter(&applied_config.user_auth, "rate_limit_user_auth")?;
+    // The CIDRs are already parsed into `IpNet` at configuration-load time
+    // (`csv_ipnet`), so a malformed entry can never reach this point.
     let trusted_proxies = if global_ip_limiter.is_some() {
-        let parsed = applied_config
-            .trusted_proxies
-            .trusted_proxies
-            .iter()
-            .map(|cidr| {
-                cidr.parse::<IpNet>().map_err(|error| {
-                    KeystoneError::RateLimitConfig(format!(
-                        "[rate_limit_trusted_proxies] invalid CIDR {cidr:?}: {error}"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let parsed = applied_config.trusted_proxies.trusted_proxies.clone();
         if parsed.is_empty() {
             warn!(
                 "Global IP rate limiting is enabled without trusted proxies; \
@@ -288,6 +284,9 @@ fn rate_limit_key_for_ip(ip: IpAddr) -> IpRateLimitKey {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
+    use openstack_keystone_config::ProxyHeader;
+
     use super::*;
 
     fn config(enabled: bool, burst: u32, replenish: u32) -> Config {
@@ -302,7 +301,18 @@ mod tests {
     }
 
     fn check(state: &RateLimitState, ip: IpAddr) -> Result<(), Duration> {
-        state.check_ip(None, Some(ip))
+        state.check_ip(&HeaderMap::new(), Some(ip))
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        headers
     }
 
     #[test]
@@ -404,31 +414,132 @@ mod tests {
     #[test]
     fn trusted_proxy_uses_originating_client_bucket() {
         let mut cfg = config(true, 1, 1);
-        cfg.rate_limit_trusted_proxies.trusted_proxies = vec!["10.0.0.0/8".to_string()];
+        cfg.rate_limit_trusted_proxies.trusted_proxies = vec!["10.0.0.0/8".parse().unwrap()];
         let state = RateLimitState::from_config(&cfg).unwrap();
         let peer = Some("10.0.0.1".parse().unwrap());
 
-        assert!(state.check_ip(Some("203.0.113.1"), peer).is_ok());
-        assert!(state.check_ip(Some("203.0.113.1"), peer).is_err());
-        assert!(state.check_ip(Some("203.0.113.2"), peer).is_ok());
+        assert!(
+            state
+                .check_ip(&headers(&[("x-forwarded-for", "203.0.113.1")]), peer)
+                .is_ok()
+        );
+        assert!(
+            state
+                .check_ip(&headers(&[("x-forwarded-for", "203.0.113.1")]), peer)
+                .is_err()
+        );
+        assert!(
+            state
+                .check_ip(&headers(&[("x-forwarded-for", "203.0.113.2")]), peer)
+                .is_ok()
+        );
     }
 
     #[test]
-    fn untrusted_peer_cannot_spoof_bucket_with_xff() {
+    fn trusted_proxy_honours_rfc7239_forwarded_header() {
+        // A proxy emitting RFC 7239 `Forwarded` must land clients in their
+        // own buckets exactly like one emitting X-Forwarded-For.
         let mut cfg = config(true, 1, 1);
-        cfg.rate_limit_trusted_proxies.trusted_proxies = vec!["10.0.0.0/8".to_string()];
+        cfg.rate_limit_trusted_proxies.trusted_proxies = vec!["10.0.0.0/8".parse().unwrap()];
+        cfg.rate_limit_trusted_proxies.trusted_header = ProxyHeader::Forwarded;
+        let state = RateLimitState::from_config(&cfg).unwrap();
+        let peer = Some("10.0.0.1".parse().unwrap());
+
+        assert!(
+            state
+                .check_ip(
+                    &headers(&[("forwarded", "for=203.0.113.1;proto=https")]),
+                    peer,
+                )
+                .is_ok()
+        );
+        assert!(
+            state
+                .check_ip(
+                    &headers(&[("forwarded", "for=203.0.113.1;proto=https")]),
+                    peer,
+                )
+                .is_err()
+        );
+        assert!(
+            state
+                .check_ip(
+                    &headers(&[("forwarded", "for=203.0.113.2;proto=https")]),
+                    peer,
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn default_xff_ignores_client_forged_forwarded_header() {
+        let mut cfg = config(true, 1, 1);
+        cfg.rate_limit_trusted_proxies.trusted_proxies = vec!["10.0.0.0/8".parse().unwrap()];
+        let state = RateLimitState::from_config(&cfg).unwrap();
+        let peer = Some("10.0.0.1".parse().unwrap());
+
+        assert!(
+            state
+                .check_ip(
+                    &headers(&[
+                        ("forwarded", "for=203.0.113.1"),
+                        ("x-forwarded-for", "198.51.100.7"),
+                    ]),
+                    peer,
+                )
+                .is_ok()
+        );
+        // Changing only the untrusted Forwarded value cannot mint a new bucket.
+        assert!(
+            state
+                .check_ip(
+                    &headers(&[
+                        ("forwarded", "for=203.0.113.2"),
+                        ("x-forwarded-for", "198.51.100.7"),
+                    ]),
+                    peer,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn untrusted_peer_cannot_spoof_bucket_with_forwarding_headers() {
+        let mut cfg = config(true, 1, 1);
+        cfg.rate_limit_trusted_proxies.trusted_proxies = vec!["10.0.0.0/8".parse().unwrap()];
         let state = RateLimitState::from_config(&cfg).unwrap();
         let peer = Some("198.51.100.10".parse().unwrap());
 
-        assert!(state.check_ip(Some("203.0.113.1"), peer).is_ok());
-        assert!(state.check_ip(Some("203.0.113.2"), peer).is_err());
+        assert!(
+            state
+                .check_ip(
+                    &headers(&[
+                        ("forwarded", "for=203.0.113.1"),
+                        ("x-forwarded-for", "203.0.113.1"),
+                    ]),
+                    peer,
+                )
+                .is_ok()
+        );
+        assert!(
+            state
+                .check_ip(
+                    &headers(&[
+                        ("forwarded", "for=203.0.113.2"),
+                        ("x-forwarded-for", "203.0.113.2"),
+                    ]),
+                    peer,
+                )
+                .is_err()
+        );
     }
 
     #[test]
     fn missing_peer_bypasses_public_ingress_limiter() {
         let state = RateLimitState::from_config(&config(true, 1, 1)).unwrap();
-        assert!(state.check_ip(Some("203.0.113.1"), None).is_ok());
-        assert!(state.check_ip(Some("203.0.113.1"), None).is_ok());
+        let headers = headers(&[("x-forwarded-for", "203.0.113.1")]);
+        assert!(state.check_ip(&headers, None).is_ok());
+        assert!(state.check_ip(&headers, None).is_ok());
     }
 
     #[test]
@@ -461,13 +572,6 @@ mod tests {
 
         assert!(state.reload(&config(true, 0, 1)).is_err());
         assert!(check(&state, ip).is_err());
-    }
-
-    #[test]
-    fn invalid_trusted_proxy_fails_when_limiter_enabled() {
-        let mut cfg = config(true, 1, 1);
-        cfg.rate_limit_trusted_proxies.trusted_proxies = vec!["not-a-cidr".to_string()];
-        assert!(RateLimitState::from_config(&cfg).is_err());
     }
 
     fn user_config(enabled: bool, burst: u32, replenish: u32) -> Config {
@@ -574,4 +678,11 @@ mod tests {
             "fresh entry survives trim"
         );
     }
+
+    // NOTE: a malformed trusted-proxy CIDR can no longer reach
+    // `RateLimitState::from_config` — `[rate_limit_trusted_proxies]` is
+    // deserialized straight into `Vec<IpNet>` (`csv_ipnet`), so a bad entry
+    // fails configuration loading. That path is covered by
+    // `deserialize_malformed_trusted_proxy_fails` in
+    // `crates/config/src/rate_limit.rs`.
 }
