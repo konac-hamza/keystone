@@ -33,7 +33,11 @@ pub async fn delete(
         .exec(db)
         .await
         .context("deleting application credential")?;
-    Ok(())
+    if res.rows_affected == 1 {
+        Ok(())
+    } else {
+        Err(ApplicationCredentialProviderError::ApplicationCredentialNotFound(id.to_string()))
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -45,10 +49,6 @@ mod tests {
     #[tokio::test]
     async fn test_delete() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([vec![get_application_credential_mock(
-                "app_cred_id",
-                Some(12345),
-            )]])
             .append_exec_results([MockExecResult {
                 last_insert_id: 0,
                 rows_affected: 1,
@@ -59,25 +59,21 @@ mod tests {
 
         assert_eq!(
             db.into_transaction_log(),
-            [
-                Transaction::from_sql_and_values(
-                    DatabaseBackend::Postgres,
-                    r#"SELECT "application_credential"."internal_id", "application_credential"."id", "application_credential"."name", "application_credential"."secret_hash", "application_credential"."description", "application_credential"."user_id", "application_credential"."project_id", "application_credential"."expires_at", "application_credential"."system", "application_credential"."unrestricted" FROM "application_credential" WHERE "application_credential"."id" = $1 LIMIT $2"#,
-                    ["app_cred_id".into(), 1u64.into()]
-                ),
-                Transaction::from_sql_and_values(
-                    DatabaseBackend::Postgres,
-                    r#"DELETE FROM "application_credential" WHERE "application_credential"."internal_id" = $1"#,
-                    [12345i32.into()]
-                ),
-            ]
+            [Transaction::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                r#"DELETE FROM "application_credential" WHERE "application_credential"."id" = $1"#,
+                ["app_cred_id".into()]
+            )]
         );
     }
 
     #[tokio::test]
     async fn test_delete_not_found() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([Vec::<crate::entity::application_credential::Model>::new()])
+            .append_exec_results([MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
             .into_connection();
 
         let result = delete(&db, "non-existing-id").await;
