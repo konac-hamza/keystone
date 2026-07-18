@@ -14,6 +14,7 @@
 //! # Application credential API types
 
 use chrono::{DateTime, Utc};
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "validate")]
 use validator::Validate;
@@ -151,7 +152,7 @@ pub struct ApplicationCredentialCreateRequest {
 }
 
 /// Application credential as returned by create — includes secret (shown once only).
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "validate", derive(validator::Validate))]
 pub struct ApplicationCredentialCreated {
@@ -183,7 +184,9 @@ pub struct ApplicationCredentialCreated {
     /// The secret used for authentication. The secret is hashed before storage,
     /// so this is the only time it is returned in plaintext. If lost, a new
     /// application credential must be created.
-    pub secret: String,
+    #[serde(serialize_with = "serialize_secret")]
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
+    pub secret: SecretString,
 
     /// Whether this credential has unrestricted access.
     pub unrestricted: bool,
@@ -218,4 +221,12 @@ pub struct ApplicationCredentialListParameters {
     /// name matches this value are returned.
     #[cfg_attr(feature = "validate", validate(length(max = 255)))]
     pub name: Option<String>,
+}
+
+fn serialize_secret<S>(secret: &SecretString, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use secrecy::ExposeSecret;
+    serializer.serialize_str(secret.expose_secret())
 }

@@ -62,7 +62,7 @@ impl From<provider_types::ApplicationCredentialCreateResponse>
             name: value.name,
             project_id: value.project_id,
             roles: value.roles.into_iter().map(Into::into).collect(),
-            secret: value.secret.expose_secret().to_string(),
+            secret: value.secret.expose_secret().to_string().into(),
             unrestricted: value.unrestricted,
         }
     }
@@ -127,5 +127,18 @@ impl From<api_types_application_credential::ApplicationCredentialListParameters>
             builder.name(v);
         }
         builder
+    }
+}
+
+impl PartialEq for api_types_application_credential::ApplicationCredentialCreated {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.name == other.name
+            && self.project_id == other.project_id
+            && self.unrestricted == other.unrestricted
+            && self.roles == other.roles
+            && self.description == other.description
+            && self.expires_at == other.expires_at
+            && self.access_rules == other.access_rules
     }
 }

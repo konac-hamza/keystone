@@ -122,7 +122,7 @@ mod tests {
 
     use openstack_keystone_core_types::application_credential::ApplicationCredentialCreateResponseBuilder;
     use openstack_keystone_core_types::identity::*;
-    use secrecy::SecretString;
+    use secrecy::{ExposeSecret, SecretString};
 
     use crate::api::tests::{get_mocked_state, test_fixture_scoped};
     use crate::api::v3::openapi_router;
@@ -218,7 +218,7 @@ mod tests {
         assert_eq!(res.application_credential.id, "new-cred-id");
         assert_eq!(res.application_credential.name, "my-cred");
         // secret must be present in create response
-        assert!(!res.application_credential.secret.is_empty());
+        assert!(!res.application_credential.secret.expose_secret().is_empty());
     }
 
     #[traced_test]

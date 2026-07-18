@@ -276,7 +276,7 @@ impl From<ApplicationCredentialProviderError> for KeystoneApiError {
             ApplicationCredentialProviderError::ApplicationCredentialExpired => {
                 Self::BadRequest("application credential has expired".into())
             }
-            ApplicationCredentialProviderError::AccessRuleInUse(x) => {
+            ApplicationCredentialProviderError::AccessRuleInUse(_) => {
                 Self::Conflict("application credential access rule is in use".into())
             }
             err @ ApplicationCredentialProviderError::AccessRulesUnenforced => {
