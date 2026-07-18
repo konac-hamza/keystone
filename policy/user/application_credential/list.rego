@@ -13,7 +13,12 @@ allow if {
 
 allow if { input.credentials.user_id == input.target.application_credential.user_id }
 
+violation contains {"field": "user_id", "msg": "listing application credentials requires a user_id."} if {
+    not input.target.application_credential.user_id
+}
+
 violation contains {"field": "user_id", "msg": "listing application credentials of a different user is not allowed."} if {
+    input.target.application_credential.user_id
     not input.credentials.is_admin
     not input.credentials.system == "all"
     input.credentials.user_id != input.target.application_credential.user_id

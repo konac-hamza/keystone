@@ -62,8 +62,8 @@ pub(super) async fn show(
         .enforce(
             "identity/user/application_credential/show",
             &user_auth,
-            json!({"application_credential": serde_json::to_value(&current)?}),
-            None,
+            json!({"application_credential": null}),
+            Some(json!({"application_credential": serde_json::to_value(&current)?})),
         )
         .await?;
 

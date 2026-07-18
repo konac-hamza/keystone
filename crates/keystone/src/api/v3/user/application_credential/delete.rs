@@ -59,8 +59,8 @@ pub(super) async fn delete(
         .enforce(
             "identity/user/application_credential/delete",
             &user_auth,
-            json!({"application_credential": serde_json::to_value(&current)?}),
-            None,
+            json!({"application_credential": null}),
+            Some(json!({"application_credential": serde_json::to_value(&current)?})),
         )
         .await?;
 

@@ -14,6 +14,7 @@
 use crate::api_v3::identity::application_credential::list::get_project_scoped_client;
 use eyre::Result;
 use openstack_keystone_api_types::v3::application_credential::application_credential::*;
+use secrecy::ExposeSecret;
 use test_api::guard::ResourceGuard;
 use test_api::identity::application_credential::create_application_credential;
 use tracing_test::traced_test;
@@ -40,7 +41,7 @@ async fn test_create() -> Result<()> {
     .await?;
 
     assert_eq!(cred.name, "test-cred");
-    assert!(!cred.secret.is_empty());
+    assert!(!cred.secret.expose_secret().is_empty());
     assert_eq!(cred.user_id, user_id);
 
     cred.delete().await?;
