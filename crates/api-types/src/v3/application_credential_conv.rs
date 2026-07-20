@@ -95,6 +95,9 @@ impl From<api_types_application_credential::ApplicationCredentialCreate>
         if let Some(v) = value.unrestricted {
             builder.unrestricted(v);
         }
+        if let Some(v) = value.secret {
+            builder.secret(v);
+        }
         builder
     }
 }
@@ -140,5 +143,17 @@ impl PartialEq for api_types_application_credential::ApplicationCredentialCreate
             && self.description == other.description
             && self.expires_at == other.expires_at
             && self.access_rules == other.access_rules
+    }
+}
+
+impl PartialEq for api_types_application_credential::ApplicationCredentialCreate {
+    fn eq(&self, other: &Self) -> bool {
+        self.access_rules == other.access_rules
+            && self.description == other.description
+            && self.expires_at == other.expires_at
+            && self.name == other.name
+            && self.roles == other.roles
+            && self.unrestricted == other.unrestricted
+        // secret is intentionally excluded — SecretBox does not implement PartialEq
     }
 }

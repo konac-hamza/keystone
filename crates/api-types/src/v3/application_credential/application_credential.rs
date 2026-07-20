@@ -82,7 +82,7 @@ pub struct ApplicationCredential {
 }
 
 /// Data for creating an application credential.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(
     feature = "builder",
     derive(derive_builder::Builder),
@@ -122,6 +122,16 @@ pub struct ApplicationCredentialCreate {
     /// project when empty.
     #[cfg_attr(feature = "builder", builder(default))]
     pub roles: Vec<RoleRef>,
+
+    /// Optional secret to use for the new credential. If not provided, a
+    /// random secret will be generated.
+    #[cfg_attr(feature = "builder", builder(default))]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_secret"
+    )]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<String>))]
+    pub secret: Option<SecretString>,
 
     /// Whether to allow unrestricted access. When `true`, the credential can
     /// create additional application credentials or trusts, which is
@@ -229,4 +239,18 @@ where
 {
     use secrecy::ExposeSecret;
     serializer.serialize_str(secret.expose_secret())
+}
+
+fn serialize_optional_secret<S>(
+    secret: &Option<SecretString>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use secrecy::ExposeSecret;
+    match secret {
+        Some(s) => serializer.serialize_str(s.expose_secret()),
+        None => serializer.serialize_none(),
+    }
 }
