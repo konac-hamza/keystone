@@ -19,9 +19,9 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "validate")]
 use validator::Validate;
 
+use crate::common;
 use crate::v3::application_credential::access_rule::{AccessRule, AccessRuleCreate};
 use crate::v3::role::RoleRef;
-
 /// Full application credential representation.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[cfg_attr(
@@ -128,7 +128,7 @@ pub struct ApplicationCredentialCreate {
     #[cfg_attr(feature = "builder", builder(default))]
     #[serde(
         skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_optional_secret"
+        serialize_with = "common::serialize_optional_secret"
     )]
     #[cfg_attr(feature = "openapi", schema(value_type = Option<String>))]
     pub secret: Option<SecretString>,
@@ -194,7 +194,7 @@ pub struct ApplicationCredentialCreated {
     /// The secret used for authentication. The secret is hashed before storage,
     /// so this is the only time it is returned in plaintext. If lost, a new
     /// application credential must be created.
-    #[serde(serialize_with = "serialize_secret")]
+    #[serde(serialize_with = "common::serialize_secret_string")]
     #[cfg_attr(feature = "openapi", schema(value_type = String))]
     pub secret: SecretString,
 
@@ -231,26 +231,4 @@ pub struct ApplicationCredentialListParameters {
     /// name matches this value are returned.
     #[cfg_attr(feature = "validate", validate(length(max = 255)))]
     pub name: Option<String>,
-}
-
-fn serialize_secret<S>(secret: &SecretString, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    use secrecy::ExposeSecret;
-    serializer.serialize_str(secret.expose_secret())
-}
-
-fn serialize_optional_secret<S>(
-    secret: &Option<SecretString>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    use secrecy::ExposeSecret;
-    match secret {
-        Some(s) => serializer.serialize_str(s.expose_secret()),
-        None => serializer.serialize_none(),
-    }
 }
