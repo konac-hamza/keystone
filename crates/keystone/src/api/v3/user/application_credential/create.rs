@@ -89,8 +89,7 @@ pub(super) async fn create(
     )
     .user_id(user_id.clone())
     .project_id(project_id)
-    .build()
-    .unwrap();
+    .build()?;
 
     // Verify user exists — 404 if not found
     state
