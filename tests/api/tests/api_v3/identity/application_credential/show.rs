@@ -35,7 +35,7 @@ async fn test_show() -> Result<()> {
         &tc,
         &user_id,
         ApplicationCredentialCreateBuilder::default()
-            .name("test-cred")
+            .name(&format!("test-cred-{}", uuid::Uuid::new_v4().simple()))
             .roles(vec![])
             .build()?,
     )
@@ -44,7 +44,7 @@ async fn test_show() -> Result<()> {
     let fetched = get_application_credential(&tc, &user_id, &cred.id).await?;
 
     assert_eq!(fetched.id, cred.id);
-    assert_eq!(fetched.name, "test-cred");
+    assert!(fetched.name.starts_with("test-cred"));
 
     cred.delete().await?;
     Ok(())

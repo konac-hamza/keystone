@@ -45,7 +45,7 @@ async fn test_list() -> Result<()> {
         &tc,
         &user_id,
         ApplicationCredentialCreateBuilder::default()
-            .name("cred-1")
+            .name(&format!("test-cred-{}", uuid::Uuid::new_v4().simple()))
             .roles(vec![])
             .build()?,
     )
@@ -55,7 +55,7 @@ async fn test_list() -> Result<()> {
         &tc,
         &user_id,
         ApplicationCredentialCreateBuilder::default()
-            .name("cred-2")
+            .name(&format!("test-cred-{}", uuid::Uuid::new_v4().simple()))
             .roles(vec![])
             .build()?,
     )

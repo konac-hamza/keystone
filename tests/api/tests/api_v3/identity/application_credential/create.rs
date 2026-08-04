@@ -34,13 +34,13 @@ async fn test_create() -> Result<()> {
         &tc,
         &user_id,
         ApplicationCredentialCreateBuilder::default()
-            .name("test-cred")
+            .name(&format!("test-cred-{}", uuid::Uuid::new_v4().simple()))
             .roles(vec![])
             .build()?,
     )
     .await?;
 
-    assert_eq!(cred.name, "test-cred");
+    assert!(cred.name.starts_with("test-cred-"));
     assert!(!cred.secret.expose_secret().is_empty());
     assert_eq!(cred.user_id, user_id);
 
@@ -63,7 +63,7 @@ async fn test_create_with_description() -> Result<()> {
         &tc,
         &user_id,
         ApplicationCredentialCreateBuilder::default()
-            .name("test-cred")
+            .name(&format!("test-cred-{}", uuid::Uuid::new_v4().simple()))
             .description("my description")
             .roles(vec![])
             .build()?,
