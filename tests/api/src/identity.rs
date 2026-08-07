@@ -14,3 +14,4 @@
 pub mod application_credential;
 pub mod group;
 pub mod user;
+pub mod user_v4;

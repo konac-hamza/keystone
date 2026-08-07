@@ -16,3 +16,4 @@ pub mod auth_plugin;
 pub mod ec2;
 pub mod project;
 pub mod token;
+pub mod token_v4;

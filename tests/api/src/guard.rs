@@ -72,6 +72,22 @@ where
     pub fn resource(&self) -> Option<&T> {
         self.resource.as_ref()
     }
+
+    /// Consume the guard and return the resource *without* deleting it,
+    /// transferring cleanup responsibility to the caller.
+    ///
+    /// For tests whose subject is the delete endpoint itself: the resource
+    /// is removed by the call under test, so the guard must neither issue a
+    /// second DELETE (which would 404) nor report the resource leaked.
+    /// Prefer [`ResourceGuard::delete`] everywhere else — this opts out of
+    /// the leak detection.
+    pub fn into_inner(mut self) -> T {
+        // Suppress the `Drop` leak report: cleanup is the caller's now.
+        self.was_deleted = true;
+        self.resource
+            .take()
+            .expect("resource is only taken by the consuming delete()")
+    }
 }
 
 impl<T> std::fmt::Debug for AsyncResourceGuard<T>

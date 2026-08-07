@@ -11,20 +11,4 @@
 // limitations under the License.
 //
 // SPDX-License-Identifier: Apache-2.0
-//! Keystone API v4 functional tests.
-//!
-//! This suite can not be executed against python Keystone.
-
-mod api_v4 {
-    mod api_key;
-    mod auth;
-    mod federation;
-    mod identity;
-    mod mapping;
-    mod oauth2;
-    mod role;
-    mod role_assignment;
-    mod scim_realm;
-    mod token_restriction;
-    mod webauthn;
-}
+mod token;

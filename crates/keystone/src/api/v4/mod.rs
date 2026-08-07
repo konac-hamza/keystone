@@ -70,11 +70,16 @@ pub(super) fn openapi_router() -> OpenApiRouter<ServiceState> {
         .nest("/oauth2", oauth2::openapi_router())
         .nest("/federation", federation::openapi_router())
         .nest("/k8s_auth", k8s_auth::openapi_router())
-        .nest("/role_assignments", role_assignment::openapi_router())
         .nest("/roles", role::openapi_router())
         .nest("/scim_realms", scim_realm::openapi_router())
         .nest("/tokens", token::openapi_router())
         .nest("/users", user::openapi_router())
+        // The role assignment sub-routes register absolute paths
+        // (`/role_assignments`, `/projects/…`, `/system/…`), so they are
+        // merged rather than nested — the same wiring as `api::v3`. Nesting
+        // them under `/role_assignments` would prefix those absolute paths
+        // and yield `/v4/role_assignments/role_assignments`.
+        .merge(role_assignment::openapi_router())
         .routes(routes!(version))
 }
 

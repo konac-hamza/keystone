@@ -126,3 +126,218 @@ pub mod grant {
         Ok(())
     }
 }
+
+/// The same grant/check/list/revoke surface through `/v4`.
+///
+/// `crates/keystone/src/api/v4/role_assignment/mod.rs` re-mounts the v3
+/// router, and the sub-routes carry absolute paths, so v4 publishes
+/// `/v4/projects/…`, `/v4/system/…` and `/v4/role_assignments` — the same
+/// shapes as v3, one version prefix up.
+pub mod v4 {
+    use super::*;
+
+    // The grant-listing endpoints answer with
+    // `RoleAssignmentRoleList { roles: Vec<role_assignment::Role> }`, whose
+    // `Role` carries an *optional* `name` — not `v3::role::Role`, which
+    // requires it.
+    use openstack_keystone_api_types::v3::role_assignment::{Assignment, Role};
+
+    /// Endpoint targeting a single `{scope}/users/{user}/roles/{role}`
+    /// triple, parameterised by HTTP method so grant (PUT), check (HEAD)
+    /// and revoke (DELETE) share one impl.
+    #[derive(Clone, Debug)]
+    struct RoleAssignmentV4Request {
+        method: http::Method,
+        endpoint: String,
+    }
+
+    impl RestEndpoint for RoleAssignmentV4Request {
+        fn method(&self) -> http::Method {
+            self.method.clone()
+        }
+
+        fn endpoint(&self) -> Cow<'static, str> {
+            self.endpoint.clone().into()
+        }
+
+        fn service_type(&self) -> ServiceType {
+            ServiceType::Identity
+        }
+
+        fn api_version(&self) -> Option<ApiVersion> {
+            Some(ApiVersion::new(4, 0))
+        }
+    }
+
+    async fn ignore_v4(
+        client: &Arc<AsyncOpenStack>,
+        method: http::Method,
+        endpoint: String,
+    ) -> Result<()> {
+        openstack_sdk::api::ignore(RoleAssignmentV4Request { method, endpoint })
+            .query_async(client.as_ref())
+            .await?;
+        Ok(())
+    }
+
+    fn project_role_path(project_id: &str, user_id: &str, role_id: &str) -> String {
+        format!("projects/{project_id}/users/{user_id}/roles/{role_id}")
+    }
+
+    fn system_role_path(user_id: &str, role_id: &str) -> String {
+        format!("system/users/{user_id}/roles/{role_id}")
+    }
+
+    /// `PUT /v4/projects/{project_id}/users/{user_id}/roles/{role_id}`.
+    pub async fn grant_project_role_v4(
+        client: &Arc<AsyncOpenStack>,
+        project_id: &str,
+        user_id: &str,
+        role_id: &str,
+    ) -> Result<()> {
+        ignore_v4(
+            client,
+            http::Method::PUT,
+            project_role_path(project_id, user_id, role_id),
+        )
+        .await
+    }
+
+    /// `HEAD /v4/projects/{project_id}/users/{user_id}/roles/{role_id}`.
+    pub async fn check_project_role_v4(
+        client: &Arc<AsyncOpenStack>,
+        project_id: &str,
+        user_id: &str,
+        role_id: &str,
+    ) -> Result<()> {
+        ignore_v4(
+            client,
+            http::Method::HEAD,
+            project_role_path(project_id, user_id, role_id),
+        )
+        .await
+    }
+
+    /// `DELETE /v4/projects/{project_id}/users/{user_id}/roles/{role_id}`.
+    pub async fn revoke_project_role_v4(
+        client: &Arc<AsyncOpenStack>,
+        project_id: &str,
+        user_id: &str,
+        role_id: &str,
+    ) -> Result<()> {
+        ignore_v4(
+            client,
+            http::Method::DELETE,
+            project_role_path(project_id, user_id, role_id),
+        )
+        .await
+    }
+
+    /// `PUT /v4/system/users/{user_id}/roles/{role_id}`.
+    pub async fn grant_system_role_v4(
+        client: &Arc<AsyncOpenStack>,
+        user_id: &str,
+        role_id: &str,
+    ) -> Result<()> {
+        ignore_v4(
+            client,
+            http::Method::PUT,
+            system_role_path(user_id, role_id),
+        )
+        .await
+    }
+
+    /// `HEAD /v4/system/users/{user_id}/roles/{role_id}`.
+    pub async fn check_system_role_v4(
+        client: &Arc<AsyncOpenStack>,
+        user_id: &str,
+        role_id: &str,
+    ) -> Result<()> {
+        ignore_v4(
+            client,
+            http::Method::HEAD,
+            system_role_path(user_id, role_id),
+        )
+        .await
+    }
+
+    /// `DELETE /v4/system/users/{user_id}/roles/{role_id}`.
+    pub async fn revoke_system_role_v4(
+        client: &Arc<AsyncOpenStack>,
+        user_id: &str,
+        role_id: &str,
+    ) -> Result<()> {
+        ignore_v4(
+            client,
+            http::Method::DELETE,
+            system_role_path(user_id, role_id),
+        )
+        .await
+    }
+
+    /// A `GET` returning a collection under `response_key`.
+    #[derive(Clone, Debug)]
+    struct RoleAssignmentV4ListRequest {
+        endpoint: String,
+        response_key: &'static str,
+    }
+
+    impl RestEndpoint for RoleAssignmentV4ListRequest {
+        fn method(&self) -> http::Method {
+            http::Method::GET
+        }
+
+        fn endpoint(&self) -> Cow<'static, str> {
+            self.endpoint.clone().into()
+        }
+
+        fn service_type(&self) -> ServiceType {
+            ServiceType::Identity
+        }
+
+        fn response_key(&self) -> Option<Cow<'static, str>> {
+            Some(self.response_key.into())
+        }
+
+        fn api_version(&self) -> Option<ApiVersion> {
+            Some(ApiVersion::new(4, 0))
+        }
+    }
+
+    /// `GET /v4/projects/{project_id}/users/{user_id}/roles`.
+    pub async fn list_project_roles_v4(
+        client: &Arc<AsyncOpenStack>,
+        project_id: &str,
+        user_id: &str,
+    ) -> Result<Vec<Role>> {
+        Ok(RoleAssignmentV4ListRequest {
+            endpoint: format!("projects/{project_id}/users/{user_id}/roles"),
+            response_key: "roles",
+        }
+        .query_async(client.as_ref())
+        .await?)
+    }
+
+    /// `GET /v4/system/users/{user_id}/roles`.
+    pub async fn list_system_roles_v4(
+        client: &Arc<AsyncOpenStack>,
+        user_id: &str,
+    ) -> Result<Vec<Role>> {
+        Ok(RoleAssignmentV4ListRequest {
+            endpoint: format!("system/users/{user_id}/roles"),
+            response_key: "roles",
+        }
+        .query_async(client.as_ref())
+        .await?)
+    }
+
+    /// `GET /v4/role_assignments`.
+    pub async fn list_role_assignments_v4(client: &Arc<AsyncOpenStack>) -> Result<Vec<Assignment>> {
+        Ok(RoleAssignmentV4ListRequest {
+            endpoint: "role_assignments".to_string(),
+            response_key: "role_assignments",
+        }
+        .query_async(client.as_ref())
+        .await?)
+    }
+}

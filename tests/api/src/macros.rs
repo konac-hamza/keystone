@@ -92,7 +92,9 @@
 //!   `pub async fn <func>(tc, id) -> Result<model>`.
 //! - `update`: private request struct, `RestEndpoint` impl (PATCH `path/{id}`,
 //!   JSON body under `body_key`), and `pub async fn <func>(tc, id,
-//!   <update_type>) -> Result<model>`.
+//!   <update_type>) -> Result<model>`. `update_put` is the identical arm
+//!   emitting `PUT` instead — every v4 update handler declares `put` where
+//!   its v3 counterpart declares `patch`, so v4 helpers need it.
 //! - `list`: **public** request struct with `Option<String>` query fields,
 //!   `RestEndpoint` impl (GET `path`), and `pub async fn <func>(tc, params) ->
 //!   Result<Vec<model>>`.
@@ -362,6 +364,62 @@ macro_rules! crud_endpoint {
         service = $service:ident,
         api_version = ($major:literal, $minor:literal) $(,)?
     }) => {
+        crud_endpoint!(@ update_with_method {
+            method = PATCH,
+            request = $request,
+            func = $func,
+            path = $path,
+            body_key = $body_key,
+            update_type = $update_type,
+            model = $model,
+            response_key = $response_key,
+            service = $service,
+            api_version = ($major, $minor),
+        });
+    };
+
+    // `PUT` flavour of `update`. Every v4 update handler declares `put`
+    // where its v3 counterpart declares `patch` (see the `#[utoipa::path]`
+    // attributes under `crates/keystone/src/api/v4/`), so v4 helpers use
+    // this arm and a `PATCH` would be answered with 405.
+    (@ update_put {
+        request = $request:ident,
+        func = $func:ident,
+        path = $path:literal,
+        body_key = $body_key:literal,
+        update_type = $update_type:ty,
+        model = $model:ty,
+        response_key = $response_key:literal,
+        service = $service:ident,
+        api_version = ($major:literal, $minor:literal) $(,)?
+    }) => {
+        crud_endpoint!(@ update_with_method {
+            method = PUT,
+            request = $request,
+            func = $func,
+            path = $path,
+            body_key = $body_key,
+            update_type = $update_type,
+            model = $model,
+            response_key = $response_key,
+            service = $service,
+            api_version = ($major, $minor),
+        });
+    };
+
+    // Shared codegen behind `update` and `update_put`.
+    (@ update_with_method {
+        method = $method:ident,
+        request = $request:ident,
+        func = $func:ident,
+        path = $path:literal,
+        body_key = $body_key:literal,
+        update_type = $update_type:ty,
+        model = $model:ty,
+        response_key = $response_key:literal,
+        service = $service:ident,
+        api_version = ($major:literal, $minor:literal) $(,)?
+    }) => {
         #[derive(Clone, Debug)]
         struct $request {
             id: String,
@@ -370,7 +428,7 @@ macro_rules! crud_endpoint {
 
         impl ::openstack_sdk::api::rest_endpoint_prelude::RestEndpoint for $request {
             fn method(&self) -> ::http::Method {
-                ::http::Method::PATCH
+                ::http::Method::$method
             }
 
             fn endpoint(&self) -> ::std::borrow::Cow<'static, str> {

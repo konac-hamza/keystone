@@ -22,7 +22,10 @@ tracing.workspace = true
 
 [dev-dependencies]
 openstack-keystone-core = { workspace = true, features = ["mock"] }
-sea-orm = { workspace = true, features = ["mock", "sqlx-sqlite" ]}
+# `runtime-tokio` is required by the real-pool regression test in
+# `update.rs`; `sqlx` panics without a runtime feature. Same as
+# `credential-driver-sql`, which also tests against a live SQLite.
+sea-orm = { workspace = true, features = ["mock", "sqlx-sqlite", "runtime-tokio" ]}
 tokio = { workspace = true, features = ["macros"] }
 
 [lints]

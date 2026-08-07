@@ -11,95 +11,63 @@
 // limitations under the License.
 //
 // SPDX-License-Identifier: Apache-2.0
-
-use std::borrow::Cow;
-use std::sync::Arc;
-
-use derive_builder::Builder;
-use eyre::Result;
+//! Token restriction (`/v4/tokens/restrictions`) REST endpoint helpers,
+//! generated with [`crate::macros::crud_endpoint`].
 
 use openstack_keystone_api_types::v4::token_restriction::*;
-use openstack_sdk::api::rest_endpoint_prelude::*;
-use openstack_sdk::{AsyncOpenStack, api::QueryAsync};
 
-use crate::guard::*;
+use crate::macros::crud_endpoint;
 
-#[derive(Builder, Clone, Debug)]
-#[builder(setter(strip_option, into))]
-struct TokenRestrictionCreateRequest {
-    restriction: TokenRestrictionCreate,
-}
-
-impl RestEndpoint for TokenRestrictionCreateRequest {
-    fn method(&self) -> http::Method {
-        http::Method::POST
+crud_endpoint! {
+    create {
+        request = TokenRestrictionCreateRequest,
+        func = create_token_restriction,
+        path = "tokens/restrictions",
+        body_key = "restriction",
+        create_type = TokenRestrictionCreate,
+        model = TokenRestriction,
+        response_key = "restriction",
+        service = Identity,
+        api_version = (4, 0),
     }
-
-    fn endpoint(&self) -> Cow<'static, str> {
-        "tokens/restrictions".to_string().into()
+    show {
+        request = TokenRestrictionShowRequest,
+        func = get_token_restriction,
+        path = "tokens/restrictions",
+        model = TokenRestriction,
+        response_key = "restriction",
+        service = Identity,
+        api_version = (4, 0),
     }
-
-    fn body(&self) -> Result<Option<(&'static str, Vec<u8>)>, BodyError> {
-        let mut params = JsonBodyParams::default();
-        params.push("restriction", serde_json::to_value(&self.restriction)?);
-        params.into_body()
+    // `update_put`: `crates/keystone/src/api/v4/token/restriction/update.rs`
+    // declares `put`, as every v4 update handler does.
+    update_put {
+        request = TokenRestrictionUpdateRequest,
+        func = update_token_restriction,
+        path = "tokens/restrictions",
+        body_key = "restriction",
+        update_type = TokenRestrictionUpdate,
+        model = TokenRestriction,
+        response_key = "restriction",
+        service = Identity,
+        api_version = (4, 0),
     }
-
-    fn service_type(&self) -> ServiceType {
-        ServiceType::Identity
+    list {
+        request = TokenRestrictionListRequest,
+        func = list_token_restrictions,
+        path = "tokens/restrictions",
+        model = TokenRestriction,
+        response_key = "restrictions",
+        service = Identity,
+        api_version = (4, 0),
+        query = [domain_id, user_id, project_id],
     }
-
-    fn response_key(&self) -> Option<Cow<'static, str>> {
-        Some("restriction".into())
-    }
-
-    fn api_version(&self) -> Option<ApiVersion> {
-        Some(ApiVersion::new(4, 0))
-    }
-}
-
-/// Create project
-pub async fn create_token_restriction(
-    tc: &Arc<AsyncOpenStack>,
-    obj: TokenRestrictionCreate,
-) -> Result<AsyncResourceGuard<TokenRestriction>> {
-    let obj: TokenRestriction = TokenRestrictionCreateRequestBuilder::default()
-        .restriction(obj)
-        .build()?
-        .query_async(tc.as_ref())
-        .await?;
-    Ok(AsyncResourceGuard::new(obj, tc.clone()))
-}
-
-struct TokenRestrictionDeleteRequest {
-    id: String,
-}
-
-impl RestEndpoint for TokenRestrictionDeleteRequest {
-    fn method(&self) -> http::Method {
-        http::Method::DELETE
-    }
-
-    fn endpoint(&self) -> Cow<'static, str> {
-        format!("tokens/restrictions/{id}", id = self.id).into()
-    }
-
-    fn service_type(&self) -> ServiceType {
-        ServiceType::Identity
-    }
-
-    fn api_version(&self) -> Option<ApiVersion> {
-        Some(ApiVersion::new(4, 0))
-    }
-}
-
-#[async_trait::async_trait]
-impl DeletableResource for TokenRestriction {
-    async fn delete(&self, state: &Arc<AsyncOpenStack>) -> Result<()> {
-        Ok(openstack_sdk::api::ignore(TokenRestrictionDeleteRequest {
-            id: self.id.clone(),
-        })
-        .query_async(state.as_ref())
-        .await?)
+    delete {
+        request = TokenRestrictionDeleteRequest,
+        func = delete_token_restriction,
+        path = "tokens/restrictions",
+        model = TokenRestriction,
+        service = Identity,
+        api_version = (4, 0),
     }
 }

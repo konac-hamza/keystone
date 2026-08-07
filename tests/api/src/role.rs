@@ -24,6 +24,7 @@ use openstack_sdk::{AsyncOpenStack, api::QueryAsync};
 use crate::guard::*;
 
 pub mod imply;
+pub mod v4;
 
 #[derive(Builder, Clone, Debug, Default)]
 #[builder(setter(strip_option, into))]

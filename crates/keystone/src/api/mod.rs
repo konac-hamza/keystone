@@ -460,6 +460,59 @@ pub(crate) mod tests {
         assert_eq!(with_slash.status(), canonical.status());
     }
 
+    /// The v4 role assignment routes must be *merged*, not nested.
+    ///
+    /// Their sub-routers register absolute paths (`/role_assignments`,
+    /// `/projects/{project_id}/users/…`, `/system/users/…`), so nesting them
+    /// under `/role_assignments` — as `api::v4` previously did — prefixes
+    /// those absolute paths and publishes
+    /// `/v4/role_assignments/role_assignments` and
+    /// `/v4/role_assignments/projects/…` instead. `api::v3` has always
+    /// merged them; this pins v4 to the same shape.
+    ///
+    /// Routing is asserted by *absence of 404*: every route here requires
+    /// auth, so a correctly mounted path is rejected by the auth layer
+    /// (401/403) rather than by the router.
+    #[tokio::test]
+    async fn v4_role_assignment_routes_are_merged_not_nested() {
+        let state = get_mocked_state(Provider::mocked_builder(), false, None).await;
+        let (router, _) = openapi_router().split_for_parts();
+        let app = NormalizePathLayer::trim_trailing_slash().layer(router.with_state(state));
+
+        let status_of = async |uri: &'static str| {
+            app.clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        };
+
+        for uri in [
+            "/v4/role_assignments",
+            "/v4/projects/p1/users/u1/roles",
+            "/v4/system/users/u1/roles",
+        ] {
+            assert_ne!(
+                status_of(uri).await,
+                StatusCode::NOT_FOUND,
+                "`{uri}` must be routed by the merged v4 role assignment router",
+            );
+        }
+
+        // The paths the nested mount used to publish must not exist.
+        for uri in [
+            "/v4/role_assignments/role_assignments",
+            "/v4/role_assignments/projects/p1/users/u1/roles",
+            "/v4/role_assignments/system/users/u1/roles",
+        ] {
+            assert_eq!(
+                status_of(uri).await,
+                StatusCode::NOT_FOUND,
+                "`{uri}` is an artefact of nesting absolute paths and must not be routed",
+            );
+        }
+    }
+
     /// Issue #358: the public listener captures the raw TCP peer address into a
     /// `ConnectInfo<SocketAddr>` request extension (the keystone-ng analogue of
     /// Python Keystone's WSGI `REMOTE_ADDR`). This verifies the capture works

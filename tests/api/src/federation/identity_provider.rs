@@ -11,11 +11,16 @@
 // limitations under the License.
 //
 // SPDX-License-Identifier: Apache-2.0
-//! Federation identity provider REST endpoint helpers.
+//! Federation identity provider REST endpoint helpers, generated with
+//! [`crate::macros::crud_endpoint`].
 //!
-//! Only the surface `test_api::scim_realm` and `test_api::scim` need to
-//! provision a realm's required `idp_id` -- create and delete. Full identity
-//! provider CRUD is out of scope for the SCIM test suites.
+//! The routes live under `/v4` only — `crates/keystone/src/api/v4/mod.rs`
+//! nests `federation` and `api::v3` does not — so despite issue #993 listing
+//! them among the v3 holes, the suite is `tests/api_v4/federation/`.
+//!
+//! `test_api::scim_realm` and `test_api::scim` only need create and delete,
+//! to provision a realm's required `idp_id`; the remaining wrappers exercise
+//! the full CRUD surface from `tests/api_v4/federation/identity_provider.rs`.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -23,57 +28,64 @@ use std::sync::Arc;
 use eyre::Result;
 
 use openstack_keystone_api_types::federation::{
-    IdentityProvider, IdentityProviderCreate, IdentityProviderCreateBuilder,
+    IdentityProvider, IdentityProviderCreate, IdentityProviderCreateBuilder, IdentityProviderUpdate,
 };
 use openstack_sdk::api::rest_endpoint_prelude::*;
 use openstack_sdk::{AsyncOpenStack, api::QueryAsync};
 
-use crate::guard::*;
+use crate::macros::crud_endpoint;
 
-#[derive(Clone, Debug)]
-struct IdentityProviderCreateApiRequest {
-    identity_provider: IdentityProviderCreate,
-}
-
-impl RestEndpoint for IdentityProviderCreateApiRequest {
-    fn method(&self) -> http::Method {
-        http::Method::POST
+crud_endpoint! {
+    create {
+        request = IdentityProviderCreateApiRequest,
+        func = create_identity_provider,
+        path = "federation/identity_providers",
+        body_key = "identity_provider",
+        create_type = IdentityProviderCreate,
+        model = IdentityProvider,
+        response_key = "identity_provider",
+        service = Identity,
+        api_version = (4, 0),
     }
-
-    fn endpoint(&self) -> Cow<'static, str> {
-        "federation/identity_providers".into()
+    show {
+        request = IdentityProviderShowRequest,
+        func = get_identity_provider,
+        path = "federation/identity_providers",
+        model = IdentityProvider,
+        response_key = "identity_provider",
+        service = Identity,
+        api_version = (4, 0),
     }
-
-    fn body(&self) -> Result<Option<(&'static str, Vec<u8>)>, BodyError> {
-        let mut params = JsonBodyParams::default();
-        params.push(
-            "identity_provider",
-            serde_json::to_value(&self.identity_provider)?,
-        );
-        params.into_body()
+    // `update_put`: the v4 update handler declares `put`.
+    update_put {
+        request = IdentityProviderUpdateApiRequest,
+        func = update_identity_provider,
+        path = "federation/identity_providers",
+        body_key = "identity_provider",
+        update_type = IdentityProviderUpdate,
+        model = IdentityProvider,
+        response_key = "identity_provider",
+        service = Identity,
+        api_version = (4, 0),
     }
-
-    fn service_type(&self) -> ServiceType {
-        ServiceType::Identity
+    list {
+        request = IdentityProviderListRequest,
+        func = list_identity_providers,
+        path = "federation/identity_providers",
+        model = IdentityProvider,
+        response_key = "identity_providers",
+        service = Identity,
+        api_version = (4, 0),
+        query = [name, domain_id],
     }
-
-    fn response_key(&self) -> Option<Cow<'static, str>> {
-        Some("identity_provider".into())
+    delete {
+        request = IdentityProviderDeleteRequest,
+        func = delete_identity_provider,
+        path = "federation/identity_providers",
+        model = IdentityProvider,
+        service = Identity,
+        api_version = (4, 0),
     }
-
-    fn api_version(&self) -> Option<ApiVersion> {
-        Some(ApiVersion::new(4, 0))
-    }
-}
-
-pub async fn create_identity_provider(
-    tc: &Arc<AsyncOpenStack>,
-    identity_provider: IdentityProviderCreate,
-) -> Result<AsyncResourceGuard<IdentityProvider>> {
-    let obj: IdentityProvider = IdentityProviderCreateApiRequest { identity_provider }
-        .query_async(tc.as_ref())
-        .await?;
-    Ok(AsyncResourceGuard::new(obj, tc.clone()))
 }
 
 /// A realm-ready identity provider create payload: SCIM realm creation only
@@ -87,13 +99,17 @@ pub fn sample_identity_provider_create(domain_id: &str, name: &str) -> IdentityP
         .expect("valid identity provider create payload")
 }
 
-struct IdentityProviderDeleteRequest<'a> {
+/// `GET /v4/federation/identity_providers/{idp_id}` with `response_key`
+/// deliberately unset. The macro-generated `show` always unwraps
+/// `identity_provider`, so reading the envelope needs its own request.
+#[derive(Clone, Debug)]
+struct IdentityProviderShowRawRequest<'a> {
     idp_id: Cow<'a, str>,
 }
 
-impl RestEndpoint for IdentityProviderDeleteRequest<'_> {
+impl RestEndpoint for IdentityProviderShowRawRequest<'_> {
     fn method(&self) -> http::Method {
-        http::Method::DELETE
+        http::Method::GET
     }
 
     fn endpoint(&self) -> Cow<'static, str> {
@@ -109,13 +125,18 @@ impl RestEndpoint for IdentityProviderDeleteRequest<'_> {
     }
 }
 
-#[async_trait::async_trait]
-impl DeletableResource for IdentityProvider {
-    async fn delete(&self, state: &Arc<AsyncOpenStack>) -> Result<()> {
-        Ok(openstack_sdk::api::ignore(IdentityProviderDeleteRequest {
-            idp_id: self.id.clone().into(),
-        })
-        .query_async(state.as_ref())
-        .await?)
+/// The whole show body, undecoded.
+///
+/// [`IdentityProvider`] deliberately has no `oidc_client_secret` field, so a
+/// typed decode would silently drop one that leaked. Assertions about the
+/// secret being withheld must read this.
+pub async fn get_identity_provider_raw(
+    tc: &Arc<AsyncOpenStack>,
+    idp_id: &str,
+) -> Result<serde_json::Value> {
+    Ok(IdentityProviderShowRawRequest {
+        idp_id: idp_id.into(),
     }
+    .query_async(tc.as_ref())
+    .await?)
 }
