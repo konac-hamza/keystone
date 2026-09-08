@@ -49,9 +49,10 @@
 //!   (`inherited: false`, `implied_via: None`) assignment. `resolve_implied_roles`
 //!   only takes effect in this mode (again, via the model).
 //! - **otherwise** - use a raw `read` of the stored tuples (direct grants
-//!   only). An actor-only query is rejected in this mode
-//!   (`ListingActorWithoutScopeRequiresEffective`): OpenFGA's `read` cannot
-//!   enumerate tuples by user alone.
+//!   only). An actor-only query issues a type-scoped `read` (`object:
+//!   "type:"`) with a `user` filter per target type, returning only the
+//!   actor's stored tuples -- the actor-keyed counterpart of a target-scoped
+//!   listing, used by SCIM deprovisioning.
 //!
 //! A **target-scoped** listing always uses `read` (direct only) even in
 //! effective mode - this driver does not call `list-users`, so group-derived
@@ -157,24 +158,28 @@ pub struct OpenFGADriver {
     config_override: Option<Arc<OpenFGAAssignmentDriver>>,
 }
 
+/// Total per-request timeout applied to the OpenFGA HTTP client when the
+/// configuration leaves `timeout` unset. Without a cap a stalled OpenFGA store
+/// wedges an assignment call (and its caller's token issuance) indefinitely.
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+
 impl Default for OpenFGADriver {
     fn default() -> Self {
         Self {
-            openfga_client: Client::new(),
+            openfga_client: Self::client(None).unwrap_or_else(|_| Client::new()),
             config_override: None,
         }
     }
 }
 
 impl OpenFGADriver {
-    /// Build the OpenFGA HTTP client, applying `timeout_secs` as a total
-    /// per-request timeout when set.
+    /// Build the OpenFGA HTTP client with a total per-request timeout:
+    /// `timeout_secs` when set, otherwise [`DEFAULT_REQUEST_TIMEOUT_SECS`].
     fn client(timeout_secs: Option<u16>) -> Result<Client, OpenFGADriverError> {
-        let mut builder = Client::builder();
-        if let Some(secs) = timeout_secs {
-            builder = builder.timeout(Duration::from_secs(secs.into()));
-        }
-        Ok(builder.build()?)
+        let timeout = timeout_secs
+            .map(|secs| Duration::from_secs(secs.into()))
+            .unwrap_or_else(|| Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS));
+        Ok(Client::builder().timeout(timeout).build()?)
     }
 
     /// Initialize the global OpenFGA driver: [`Self::config`] reads the live
@@ -785,21 +790,30 @@ impl AssignmentBackend for OpenFGADriver {
                 }
             }
             // actor without a target scope: enumerate the objects the actor
-            // holds each role relation on, per target kind. Only answerable in
-            // effective mode - OpenFGA's `read` cannot enumerate by user alone.
+            // holds each role relation on, per target kind.
+            //
+            // - effective mode: `list-objects` per (relation, target type),
+            //   which resolves the model (group- and hierarchy-derived grants).
+            // - otherwise: a direct `read` per (target type[, relation]) with a
+            //   `user` filter and a type-scoped `object` (`type:`), which
+            //   returns only stored tuples for the actor. This is the same
+            //   "direct tuples only" contract the target-scoped branch gives,
+            //   just keyed on the actor -- SCIM deprovisioning needs to sweep a
+            //   principal's grants without knowing every target up front.
             (Some((actor_kind, actor_id)), None) => {
-                if !effective {
-                    Err(OpenFGADriverError::ListingActorWithoutScopeRequiresEffective)?;
-                }
-                let pairs: Vec<(String, String)> = match &role_relation {
-                    Some(pair) => vec![pair.clone()],
-                    None => role_relations(cfg),
-                };
                 let users = mapper.objects_for(actor_kind, actor_id);
-                let mut tasks = Vec::new();
-                for user in &users {
-                    for tkind in [Kind::Project, Kind::Domain, Kind::System] {
-                        for object_type in mapper.types_for(tkind) {
+                let target_types = [Kind::Project, Kind::Domain, Kind::System]
+                    .into_iter()
+                    .flat_map(|tkind| mapper.types_for(tkind));
+
+                if effective {
+                    let pairs: Vec<(String, String)> = match &role_relation {
+                        Some(pair) => vec![pair.clone()],
+                        None => role_relations(cfg),
+                    };
+                    let mut tasks = Vec::new();
+                    for user in &users {
+                        for object_type in target_types.clone() {
                             for (role_id, relation) in &pairs {
                                 tasks.push(async move {
                                     let mut out: Vec<Assignment> = Vec::new();
@@ -831,8 +845,38 @@ impl AssignmentBackend for OpenFGADriver {
                             }
                         }
                     }
+                    results.extend(fan_out(max_concurrency, tasks).await?);
+                } else {
+                    let role_relation_ref = &role_relation;
+                    let mut tasks = Vec::new();
+                    for user in &users {
+                        for object_type in target_types.clone() {
+                            tasks.push(async move {
+                                let tuple_key = match role_relation_ref {
+                                    Some((_, relation)) => json!({
+                                        "user": user,
+                                        "relation": relation,
+                                        "object": format!("{object_type}:"),
+                                    }),
+                                    None => json!({
+                                        "user": user,
+                                        "object": format!("{object_type}:"),
+                                    }),
+                                };
+                                let mut out: Vec<Assignment> = Vec::new();
+                                for tuple in self.openfga_read(cfg, tuple_key).await? {
+                                    if let Some(assignment) =
+                                        tuple_to_assignment(cfg, mapper, &tuple)
+                                    {
+                                        out.push(assignment);
+                                    }
+                                }
+                                Ok::<_, OpenFGADriverError>(out)
+                            });
+                        }
+                    }
+                    results.extend(fan_out(max_concurrency, tasks).await?);
                 }
-                results.extend(fan_out(max_concurrency, tasks).await?);
             }
             // target scope, maybe a role filter: read stored tuples per rep.
             // Always direct - OpenFGA's `read` does not resolve group-derived
