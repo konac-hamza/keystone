@@ -78,6 +78,49 @@ fn quarantine_meta_key(partition: &str, node_id: u64) -> String {
     format!("{QUARANTINE_META_PREFIX}{partition}:{node_id}")
 }
 
+/// Keyspace names reserved for the state machine's own storage.
+///
+/// A `StorageApi` caller must never be able to write into these directly
+/// (GitHub #1294): `"meta"` backs per-record [`Metadata`], DEK material and
+/// other engine bookkeeping; `"logs"` backs the Raft log store;
+/// `"index"` backs the secondary index; `"local_emergency"` is a
+/// node-local, non-Raft keyspace. `apply()` rejects any mutation whose
+/// caller-supplied keyspace is one of these before it touches storage.
+const RESERVED_KEYSPACES: &[&str] = &["meta", "logs", "index", "local_emergency"];
+
+/// Returns an error if `keyspace` names a keyspace reserved for internal
+/// state machine storage (see [`RESERVED_KEYSPACES`]).
+fn check_keyspace_allowed(keyspace: &str) -> Result<(), io::Error> {
+    if RESERVED_KEYSPACES.contains(&keyspace) {
+        return Err(io::Error::other(format!(
+            "keyspace '{keyspace}' is reserved for internal state machine storage"
+        )));
+    }
+    Ok(())
+}
+
+/// Builds the namespaced key under which a user record's [`Metadata`] is
+/// stored in the `meta` keyspace: `<keyspace>\0<key>`.
+///
+/// Per-record metadata used to be stored under the bare record key, with no
+/// keyspace component, so two records with the same key in different
+/// keyspaces shared one `Metadata` entry (GitHub #1294) — a `Remove` of key
+/// `K` in keyspace `A` deleted the metadata of key `K` in keyspace `B` too,
+/// after which reads of `B`'s record found ciphertext with no matching
+/// `dek_version` hint and treated it as corruption. The `\0` separator can
+/// never collide with the engine's own bare system keys (`_meta:*`,
+/// `last_applied_log`, `last_membership`), none of which contain a NUL
+/// byte, and `keyspace` itself can never be `"meta"` here since
+/// [`check_keyspace_allowed`] rejects that before any caller-supplied
+/// keyspace reaches this function.
+pub fn meta_key(keyspace: &str, key: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(keyspace.len() + 1 + key.len());
+    out.extend_from_slice(keyspace.as_bytes());
+    out.push(0);
+    out.extend_from_slice(key);
+    out
+}
+
 /// Per-partition GCM decryption failure tracker with automatic quarantine.
 ///
 /// A partition accumulates failure `Instant`s in a 60-second sliding window.
@@ -258,6 +301,28 @@ const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 /// (ADR 0028).
 const SNAPSHOT_SKIP_KEYSPACES: &[&str] = &["logs", "local_emergency"];
 
+/// Fjall meta key recording the filenames of the most recently written
+/// local snapshot files, newest first, as a msgpack-encoded `Vec<String>`
+/// (GitHub #1296 item 1).
+///
+/// `latest_snapshot_path`/`get_current_snapshot` used to pick the
+/// "latest" snapshot as the lexicographically greatest filename among
+/// `<leader_id>-<index>-<rand>`, which picks a *stale* snapshot once the
+/// applied index crosses a digit boundary (`"1-9-123" > "1-10-456"` as
+/// strings) — openraft then ships a snapshot below the purged log to a
+/// lagging follower, which can never catch up, and the `Backup` RPC
+/// silently backs up stale state. Recording the actual write order here
+/// sidesteps filename parsing entirely.
+const SNAPSHOT_HISTORY_META_KEY: &[u8] = b"_meta:snapshot:history";
+
+/// Number of local snapshot files retained on disk.
+///
+/// Kept greater than 1 so `get_current_snapshot` has an older,
+/// previously-valid file to fall back to if the newest one turns out
+/// corrupt or undecryptable at startup (GitHub #1296 item 3), instead of
+/// refusing to start with no operator recourse.
+const SNAPSHOT_KEEP: usize = 2;
+
 /// One keyspace's full contents inside a [`SnapshotPayload`]: `(key, value)`
 /// pairs exactly as stored in Fjall.
 type SnapshotKeyspaceEntries = Vec<(Vec<u8>, Vec<u8>)>;
@@ -363,6 +428,20 @@ enum ReencryptOutcome {
     AlreadyCurrent,
     /// Exhausted the CAS retry budget; left for the next rotation cycle.
     Skipped,
+}
+
+/// A deferred in-memory mutation to `pending_rotations`, applied only once
+/// the transaction's `batch` has actually committed (GitHub #1297 item 4).
+///
+/// `CreatePendingRotation`/`ConfirmPendingRotation` used to mutate
+/// `pending_rotations` directly while processing their own mutation, even
+/// though a *different* mutation later in the same `Transaction` could
+/// still produce a violation and leave the whole `batch` uncommitted —
+/// leaving the in-memory map and the Fjall `meta` entry disagreeing until
+/// restart.
+enum PendingRotationMutation {
+    Insert(String, PendingRotation),
+    Remove(String),
 }
 
 /// Summary of one background re-encryption pass over a single retired DEK
@@ -740,36 +819,119 @@ impl FjallStateMachine {
         &self.snapshot_dir
     }
 
-    /// Return the path of the most recently written snapshot file, if any.
+    /// Return the path of the most recently written snapshot file that
+    /// still exists on disk, if any.
     ///
-    /// Snapshot filenames sort lexicographically by `<leader_id>-<index>-<rand>`, so the
-    /// lexicographically greatest filename is the latest snapshot. openraft 0.10 dropped
-    /// `snapshot_id` from `SnapshotMeta`, so callers that need the on-disk path (rather than
-    /// going through `RaftStateMachine::get_current_snapshot`) must locate it this way.
+    /// Uses the persisted history recorded by [`Self::record_snapshot_and_gc`]
+    /// rather than lexicographic filename order (GitHub #1296 item 1 — see
+    /// [`SNAPSHOT_HISTORY_META_KEY`]). openraft 0.10 dropped `snapshot_id`
+    /// from `SnapshotMeta`, so callers that need the on-disk path (rather
+    /// than going through `RaftStateMachine::get_current_snapshot`) must
+    /// locate it this way.
     pub(crate) fn latest_snapshot_path(&self) -> io::Result<Option<std::path::PathBuf>> {
-        let mut latest_snapshot_id: Option<String> = None;
+        for snapshot_id in self.snapshot_history()? {
+            let path = self.snapshot_dir.join(&snapshot_id);
+            if path.is_file() {
+                return Ok(Some(path));
+            }
+        }
+        Ok(None)
+    }
 
+    /// Returns the persisted snapshot history, newest first (see
+    /// [`Self::record_snapshot_and_gc`]).
+    fn snapshot_history(&self) -> io::Result<Vec<String>> {
+        let history: Option<Vec<String>> = self
+            .meta
+            .get(SNAPSHOT_HISTORY_META_KEY)
+            .map_err(|e| io::Error::other(e.to_string()))?
+            .map(|bytes| deserialize(&bytes))
+            .transpose()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        Ok(history.unwrap_or_default())
+    }
+
+    /// Encrypts `file_bytes` (a serialized [`SnapshotFile`]) with the
+    /// current `BackupDek` and writes it to
+    /// `<snapshot_dir>/<snapshot_id>`, then records `snapshot_id` as the
+    /// newest local snapshot and garbage-collects every on-disk file that
+    /// has fallen out of the retained history (GitHub #1296 items 1-2).
+    ///
+    /// On-disk format: `[dek_version_u32_BE; 4] ++ [utc_epoch_u64_BE; 8] ++
+    /// [nonce_salt_u64_BE; 8] ++ AES-256-GCM(file_bytes)`. `nonce_salt` is
+    /// a fresh random value per snapshot rather than a per-process counter
+    /// (GitHub #1296 item 4): a counter reset to 0 on every process
+    /// restart could reuse a nonce if a snapshot were written again within
+    /// the same wall-clock second, and a missing durable counter forced
+    /// `decrypt_snapshot_file` to brute-force it (capping snapshots at
+    /// 1024 per process lifetime). A random 64-bit salt makes reuse
+    /// astronomically unlikely without any durable counter state, and is
+    /// stored directly in the header so decryption never has to guess it.
+    fn persist_snapshot_file(&self, snapshot_id: &str, file_bytes: &[u8]) -> io::Result<()> {
+        let (dek_version, backup_dek_ref) = {
+            let guard = self.dek.read().unwrap_or_else(|p| p.into_inner());
+            (guard.version, guard.backup_dek().as_bytes().to_owned())
+        };
+        use openstack_keystone_storage_crypto::dek::BackupDek;
+        let bdek = BackupDek::from_raw(backup_dek_ref);
+        let utc_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let nonce_salt: u64 = rand::rng().random();
+        let encrypted = backup_encrypt(&bdek, file_bytes, dek_version, utc_epoch, nonce_salt)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+
+        let mut disk_bytes = Vec::with_capacity(20 + encrypted.len());
+        disk_bytes.extend_from_slice(&dek_version.to_be_bytes());
+        disk_bytes.extend_from_slice(&utc_epoch.to_be_bytes());
+        disk_bytes.extend_from_slice(&nonce_salt.to_be_bytes());
+        disk_bytes.extend_from_slice(&encrypted);
+
+        let snapshot_path = self.snapshot_dir.join(snapshot_id);
+        fs::write(&snapshot_path, &disk_bytes)?;
+
+        self.record_snapshot_and_gc(snapshot_id)
+    }
+
+    /// Prepends `snapshot_id` to the persisted snapshot history, keeps
+    /// only the newest [`SNAPSHOT_KEEP`] entries, and deletes every
+    /// on-disk snapshot file that isn't one of them (GitHub #1296 item 2:
+    /// snapshot files were previously never garbage-collected, so every
+    /// `build_snapshot`/`install_snapshot` left behind a full copy of the
+    /// dataset forever).
+    fn record_snapshot_and_gc(&self, snapshot_id: &str) -> io::Result<()> {
+        let mut history = self.snapshot_history()?;
+        history.retain(|id| id != snapshot_id);
+        history.insert(0, snapshot_id.to_string());
+        history.truncate(SNAPSHOT_KEEP);
+
+        let packed = serialize(&history).map_err(|e| io::Error::other(e.to_string()))?;
+        self.meta
+            .insert(SNAPSHOT_HISTORY_META_KEY, packed)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+
+        let keep: HashSet<&str> = history.iter().map(String::as_str).collect();
         for entry in fs::read_dir(&self.snapshot_dir)? {
             let entry = entry?;
             let path = entry.path();
-
             if !path.is_file() {
                 continue;
             }
-
-            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                let snapshot_id = filename.to_string();
-
-                if latest_snapshot_id
-                    .as_ref()
-                    .is_none_or(|current| snapshot_id > *current)
-                {
-                    latest_snapshot_id = Some(snapshot_id);
-                }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !keep.contains(name)
+                && let Err(e) = fs::remove_file(&path)
+            {
+                tracing::warn!(
+                    file = name,
+                    error = %e,
+                    "failed to garbage-collect stale snapshot file"
+                );
             }
         }
-
-        Ok(latest_snapshot_id.map(|id| self.snapshot_dir.join(id)))
+        Ok(())
     }
 
     /// Validate and decrypt an operator backup blob (produced by the `Backup`
@@ -1219,7 +1381,7 @@ impl FjallStateMachine {
         let next_version = if let Some(existing) = ks.get(key)? {
             let dek_version_hint = self
                 .meta
-                .get(key)?
+                .get(meta_key(&partition, key))?
                 .map(|m| Metadata::unpack(m.as_ref()))
                 .transpose()?
                 .and_then(|m| m.dek_version);
@@ -1545,7 +1707,7 @@ impl FjallStateMachine {
             let Ok(Some(before)) = ks.get(key) else {
                 return ReencryptOutcome::AlreadyCurrent; // deleted concurrently
             };
-            let Ok(Some(meta_bytes)) = self.meta.get(key) else {
+            let Ok(Some(meta_bytes)) = self.meta.get(meta_key(keyspace_name, key)) else {
                 return ReencryptOutcome::AlreadyCurrent; // metadata gone
             };
             let Ok(metadata) = Metadata::unpack(meta_bytes.as_ref()) else {
@@ -1602,7 +1764,7 @@ impl FjallStateMachine {
             // changed underneath us.
             let mut batch = self.db.batch();
             batch.insert(ks, key.to_vec(), encrypted);
-            batch.insert(&self.meta, key.to_vec(), new_meta_bytes);
+            batch.insert(&self.meta, meta_key(keyspace_name, key), new_meta_bytes);
             if batch.commit().is_err() {
                 continue;
             }
@@ -1655,8 +1817,11 @@ fn check_snapshot_format_version(version: u32) -> Result<(), String> {
 /// Decrypt and deserialize a snapshot file from disk.
 ///
 /// On-disk format:
-/// `[dek_version_u32_BE; 4] ++ [utc_epoch_u64_BE; 8] ++
-/// backup_encrypt(rmp_serde(SnapshotFile))`.
+/// `[dek_version_u32_BE; 4] ++ [utc_epoch_u64_BE; 8] ++ [nonce_salt_u64_BE; 8] ++
+/// backup_encrypt(rmp_serde(SnapshotFile))`. `nonce_salt` is generated fresh
+/// per snapshot and stored directly in the header (GitHub #1296 item 4), so
+/// decryption needs exactly one attempt per candidate DEK epoch instead of
+/// brute-forcing a missing counter over `0..1024`.
 fn decrypt_snapshot_file(
     disk_bytes: &[u8],
     current_dek: &std::sync::Arc<std::sync::RwLock<std::sync::Arc<DekEpoch>>>,
@@ -1664,7 +1829,7 @@ fn decrypt_snapshot_file(
 ) -> Result<(SnapshotFile, u32, u64), crate::StoreError> {
     use openstack_keystone_storage_crypto::dek::BackupDek;
 
-    const HEADER_LEN: usize = 4 + 8; // version + epoch
+    const HEADER_LEN: usize = 4 + 8 + 8; // version + epoch + nonce_salt
     if disk_bytes.len() < HEADER_LEN {
         return Err(crate::StoreError::Other(eyre::eyre!(
             "snapshot file too short: {} bytes",
@@ -1681,27 +1846,30 @@ fn decrypt_snapshot_file(
             .try_into()
             .map_err(|_| crate::StoreError::Other(eyre::eyre!("invalid snapshot epoch")))?,
     );
+    let nonce_salt = u64::from_be_bytes(
+        disk_bytes[12..20]
+            .try_into()
+            .map_err(|_| crate::StoreError::Other(eyre::eyre!("invalid snapshot nonce salt")))?,
+    );
     let encrypted = &disk_bytes[HEADER_LEN..];
 
-    let try_decrypt = |epoch: &DekEpoch, counter: u64| -> Option<Vec<u8>> {
+    let try_decrypt = |epoch: &DekEpoch| -> Option<Vec<u8>> {
         if epoch.version != dek_version {
             return None;
         }
         let bdek = BackupDek::from_raw(*epoch.backup_dek().as_bytes());
-        backup_decrypt(&bdek, encrypted, dek_version, utc_epoch, counter)
+        backup_decrypt(&bdek, encrypted, dek_version, utc_epoch, nonce_salt)
             .ok()
             .map(|z| z.to_vec())
     };
 
     let file_bytes = {
         let guard = current_dek.read().unwrap_or_else(|p| p.into_inner());
-        (0u64..1024).find_map(|c| try_decrypt(&guard, c))
+        try_decrypt(&guard)
     }
     .or_else(|| {
         let old = old_deks.lock().unwrap_or_else(|p| p.into_inner());
-        old.values()
-            .flat_map(|epoch| (0u64..1024).filter_map(move |c| try_decrypt(epoch, c)))
-            .next()
+        old.values().find_map(|epoch| try_decrypt(epoch))
     })
     .ok_or_else(|| {
         crate::StoreError::Other(eyre::eyre!(
@@ -1757,41 +1925,15 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<FjallStateMachine> {
             )
         })?;
 
-        // Encrypt snapshot file at rest with BackupDek (ADR §7).
-        let (dek_version, backup_dek_ref, counter) = {
-            let guard = self.dek.read().unwrap_or_else(|p| p.into_inner());
-            (
-                guard.version,
-                guard.backup_dek().as_bytes().to_owned(),
-                guard.next_backup_counter(),
-            )
-        };
-        use openstack_keystone_storage_crypto::dek::BackupDek;
-        let bdek = BackupDek::from_raw(backup_dek_ref);
-        let utc_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let encrypted = backup_encrypt(&bdek, &file_bytes, dek_version, utc_epoch, counter)
+        // Encrypt snapshot file at rest with BackupDek (ADR §7), persist it,
+        // record it as the newest snapshot and GC stale files.
+        self.persist_snapshot_file(&snapshot_id, &file_bytes)
             .map_err(|e| {
                 StorageError::<TypeConfig>::write_snapshot(
                     Some(meta.signature()),
                     TypeConfig::err_from_error(&e),
                 )
             })?;
-        // On-disk: [dek_version_u32_BE; 4] ++ [utc_epoch_u64_BE; 8] ++ encrypted_blob
-        let mut disk_bytes = Vec::with_capacity(12 + encrypted.len());
-        disk_bytes.extend_from_slice(&dek_version.to_be_bytes());
-        disk_bytes.extend_from_slice(&utc_epoch.to_be_bytes());
-        disk_bytes.extend_from_slice(&encrypted);
-
-        let snapshot_path = self.snapshot_dir.join(&snapshot_id);
-        fs::write(&snapshot_path, &disk_bytes).map_err(|e| {
-            StorageError::<TypeConfig>::write_snapshot(
-                Some(meta.signature()),
-                TypeConfig::err_from_error(&e),
-            )
-        })?;
 
         let data_bytes = serialize(&payload).map_err(|e| {
             StorageError::<TypeConfig>::write_snapshot(
@@ -1799,7 +1941,7 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<FjallStateMachine> {
                 TypeConfig::err_from_error(&e),
             )
         })?;
-        tracing::trace!("snapshot written to {:?}", snapshot_path);
+        tracing::trace!(snapshot_id, "snapshot written");
 
         Ok(Snapshot {
             meta,
@@ -1951,30 +2093,9 @@ impl RaftStateMachine<TypeConfig> for Arc<FjallStateMachine> {
         let file_bytes = serialize(&snapshot_file)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-        // Encrypt the snapshot file at rest with the current BackupDek.
-        let (dek_version, backup_dek_ref, counter) = {
-            let guard = self.dek.read().unwrap_or_else(|p| p.into_inner());
-            (
-                guard.version,
-                guard.backup_dek().as_bytes().to_owned(),
-                guard.next_backup_counter(),
-            )
-        };
-        use openstack_keystone_storage_crypto::dek::BackupDek;
-        let bdek = BackupDek::from_raw(backup_dek_ref);
-        let utc_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let encrypted = backup_encrypt(&bdek, &file_bytes, dek_version, utc_epoch, counter)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        let mut disk_bytes = Vec::with_capacity(12 + encrypted.len());
-        disk_bytes.extend_from_slice(&dek_version.to_be_bytes());
-        disk_bytes.extend_from_slice(&utc_epoch.to_be_bytes());
-        disk_bytes.extend_from_slice(&encrypted);
-
-        let snapshot_path = self.snapshot_dir.join(&snapshot_id);
-        fs::write(&snapshot_path, &disk_bytes)?;
+        // Encrypt the snapshot file at rest with the current BackupDek,
+        // persist it, record it as the newest snapshot and GC stale files.
+        self.persist_snapshot_file(&snapshot_id, &file_bytes)?;
 
         Ok(())
     }
@@ -1983,22 +2104,36 @@ impl RaftStateMachine<TypeConfig> for Arc<FjallStateMachine> {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<SnapshotOf<TypeConfig, Vec<u8>>>, io::Error> {
-        let Some(snapshot_path) = self.latest_snapshot_path()? else {
-            return Ok(None);
-        };
-
-        let disk_bytes = fs::read(&snapshot_path)?;
-        let (snapshot_file, _, _) =
-            decrypt_snapshot_file(&disk_bytes, &self.dek, &self.old_deks)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-        let data_bytes = rmp_serde::to_vec(&snapshot_file.payload)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-        Ok(Some(Snapshot {
-            meta: snapshot_file.meta,
-            snapshot: data_bytes,
-        }))
+        // Try every retained snapshot file, newest first, falling back to
+        // an older one if the newest turns out corrupt or undecryptable
+        // (GitHub #1296 item 3) rather than refusing to start.
+        for snapshot_id in self.snapshot_history()? {
+            let snapshot_path = self.snapshot_dir.join(&snapshot_id);
+            let disk_bytes = match fs::read(&snapshot_path) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            match decrypt_snapshot_file(&disk_bytes, &self.dek, &self.old_deks) {
+                Ok((snapshot_file, _, _)) => {
+                    let data_bytes = rmp_serde::to_vec(&snapshot_file.payload)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    return Ok(Some(Snapshot {
+                        meta: snapshot_file.meta,
+                        snapshot: data_bytes,
+                    }));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        snapshot_id,
+                        error = %e,
+                        "local snapshot file failed to decode; trying an older one"
+                    );
+                }
+            }
+        }
+        tracing::warn!("no usable local snapshot file found on startup; starting without one");
+        Ok(None)
     }
 
     #[tracing::instrument(skip(self, entries))]
@@ -2008,13 +2143,30 @@ impl RaftStateMachine<TypeConfig> for Arc<FjallStateMachine> {
     {
         let mut last_membership = None;
         let mut entries = entries;
+        // Responders are collected here and only notified once the whole
+        // stream is durable (see the single `persist(SyncAll)` at the end
+        // of this function) — GitHub #1297 item 2: `apply()` used to call
+        // `persist(SyncAll)` after every single entry, i.e. at least one
+        // full-database fsync per committed write on every node; openraft
+        // only requires the state machine to be durable relative to
+        // `last_applied` once `apply()` returns, not after each entry
+        // within the batch it was given, so a single fsync at the end
+        // (after the log's own per-batch fsync in `append`) is sufficient.
+        // Sending a responder before its entry's write is actually fsynced
+        // would tell the caller "committed" ahead of durability, so every
+        // responder must wait for that final persist too.
+        let mut pending_responses: Vec<(
+            openraft::storage::ApplyResponder<TypeConfig>,
+            crate::ZeroizingResponse,
+        )> = Vec::new();
 
         while let Some((entry, responder)) = entries.try_next().await? {
             // ADR 0031 `keystone_raft_apply_duration_seconds`: measures one
-            // committed log entry's full apply — write/encrypt, commit, and
-            // the fsync-equivalent `persist(SyncAll)` below — a real
-            // per-operation latency, unlike the read-through snapshot gauges
-            // in `prometheus_metrics`.
+            // committed log entry's write/encrypt/commit latency, unlike
+            // the read-through snapshot gauges in `prometheus_metrics`.
+            // Excludes the batched `persist(SyncAll)` at the end of this
+            // function, which now covers the whole stream rather than one
+            // entry.
             let apply_start = Instant::now();
             // Held for this entry's whole processing+commit (there is no
             // further `.await` in this loop body until the next iteration),
@@ -2028,6 +2180,9 @@ impl RaftStateMachine<TypeConfig> for Arc<FjallStateMachine> {
             let mut batch = self.db.batch();
             let mut has_violations = false;
             let mut pending_dek_swap: Option<(Arc<DekEpoch>, bool)> = None;
+            // See `PendingRotationMutation`: deferred the same way as
+            // `pending_dek_swap` above.
+            let mut pending_rotation_mutation: Option<PendingRotationMutation> = None;
 
             let response = if let Some(store_req) = entry.app_data {
                 match StoreCommand::unpack(&store_req)? {
@@ -2040,12 +2195,13 @@ impl RaftStateMachine<TypeConfig> for Arc<FjallStateMachine> {
                                     keyspace,
                                     expected_revision,
                                 } => {
-                                    if keyspace == "meta" && key == KEY_LAST_MEMBERSHIP
-                                        || key == KEY_LAST_APPLIED_LOG
-                                    {
-                                        return Err(io::Error::other(
-                                            "not allowed to delete system data",
-                                        ));
+                                    if let Err(e) = check_keyspace_allowed(&keyspace) {
+                                        violations.push(Violation {
+                                            r#type: "RESERVED_KEYSPACE".to_string(),
+                                            subject: String::from_utf8_lossy(&key).to_string(),
+                                            description: e.to_string(),
+                                        });
+                                        continue;
                                     }
 
                                     if let Some(ephemeral_ks) = self.ephemeral.get(&keyspace) {
@@ -2074,7 +2230,7 @@ impl RaftStateMachine<TypeConfig> for Arc<FjallStateMachine> {
                                     if let Some(expected_revision) = expected_revision {
                                         let curr_meta = self
                                             .meta()
-                                            .get(&key)
+                                            .get(meta_key(&keyspace, &key))
                                             .map_err(|e| io::Error::other(e.to_string()))?
                                             .map(|x| Metadata::unpack(x.as_ref()))
                                             .transpose()
@@ -2095,9 +2251,9 @@ impl RaftStateMachine<TypeConfig> for Arc<FjallStateMachine> {
                                         }
                                     }
 
-                                    let ks = &self.keyspace(keyspace)?;
+                                    let ks = &self.keyspace(&keyspace)?;
                                     batch.remove(ks, key.clone());
-                                    batch.remove(&self.meta, key.clone());
+                                    batch.remove(&self.meta, meta_key(&keyspace, &key));
                                 }
                                 MutationInner::RemoveIndex { key } => {
                                     batch.remove(&self.index, key.clone());
@@ -2110,12 +2266,13 @@ impl RaftStateMachine<TypeConfig> for Arc<FjallStateMachine> {
                                     tier,
                                     expected_revision,
                                 } => {
-                                    if keyspace == "meta" && key == KEY_LAST_MEMBERSHIP
-                                        || key == KEY_LAST_APPLIED_LOG
-                                    {
-                                        return Err(io::Error::other(
-                                            "not allowed to overwrite system data",
-                                        ));
+                                    if let Err(e) = check_keyspace_allowed(&keyspace) {
+                                        violations.push(Violation {
+                                            r#type: "RESERVED_KEYSPACE".to_string(),
+                                            subject: String::from_utf8_lossy(&key).to_string(),
+                                            description: e.to_string(),
+                                        });
+                                        continue;
                                     }
 
                                     if metadata.is_ephemeral {
@@ -2146,7 +2303,7 @@ impl RaftStateMachine<TypeConfig> for Arc<FjallStateMachine> {
                                     if let Some(expected_revision) = expected_revision {
                                         let curr_meta = self
                                             .meta()
-                                            .get(&key)
+                                            .get(meta_key(&keyspace, &key))
                                             .map_err(|e| io::Error::other(e.to_string()))?
                                             .map(|x| Metadata::unpack(x.as_ref()))
                                             .transpose()
@@ -2184,7 +2341,7 @@ impl RaftStateMachine<TypeConfig> for Arc<FjallStateMachine> {
                                             meta_with_tier.dek_version = Some(dek_version);
                                             batch.insert(
                                                 &self.meta,
-                                                key.clone(),
+                                                meta_key(&keyspace, &key),
                                                 meta_with_tier
                                                     .pack()
                                                     .map_err(|e| io::Error::other(e.to_string()))?,
@@ -2221,6 +2378,15 @@ impl RaftStateMachine<TypeConfig> for Arc<FjallStateMachine> {
                                     metadata,
                                     tier,
                                 } => {
+                                    if let Err(e) = check_keyspace_allowed(&keyspace) {
+                                        violations.push(Violation {
+                                            r#type: "RESERVED_KEYSPACE".to_string(),
+                                            subject: String::from_utf8_lossy(&key).to_string(),
+                                            description: e.to_string(),
+                                        });
+                                        continue;
+                                    }
+
                                     if metadata.is_ephemeral {
                                         let ephemeral_ks =
                                             self.ephemeral.entry(keyspace.clone()).or_default();
@@ -2240,7 +2406,7 @@ impl RaftStateMachine<TypeConfig> for Arc<FjallStateMachine> {
 
                                     let exists = self
                                         .meta()
-                                        .get(&key)
+                                        .get(meta_key(&keyspace, &key))
                                         .map_err(|e| io::Error::other(e.to_string()))?
                                         .is_some();
                                     if exists {
@@ -2269,7 +2435,7 @@ impl RaftStateMachine<TypeConfig> for Arc<FjallStateMachine> {
                                             meta_with_tier.dek_version = Some(dek_version);
                                             batch.insert(
                                                 &self.meta,
-                                                key.clone(),
+                                                meta_key(&keyspace, &key),
                                                 meta_with_tier
                                                     .pack()
                                                     .map_err(|e| io::Error::other(e.to_string()))?,
@@ -2488,7 +2654,15 @@ impl RaftStateMachine<TypeConfig> for Arc<FjallStateMachine> {
                                         let meta_key =
                                             format!("{PENDING_ROTATION_PREFIX}{rotation_id}");
                                         batch.insert(&self.meta, meta_key.as_bytes(), serialised);
-                                        pending.insert(rotation_id.clone(), entry);
+                                        // Not inserted into `pending` yet — deferred
+                                        // until the whole transaction's `batch`
+                                        // actually commits (see
+                                        // `pending_rotation_mutation` above).
+                                        pending_rotation_mutation =
+                                            Some(PendingRotationMutation::Insert(
+                                                rotation_id.clone(),
+                                                entry,
+                                            ));
                                         tracing::info!(
                                             rotation_id,
                                             dek_version,
@@ -2506,13 +2680,22 @@ impl RaftStateMachine<TypeConfig> for Arc<FjallStateMachine> {
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
                                         .as_secs();
-                                    let entry = {
-                                        let mut pending = self
-                                            .pending_rotations
-                                            .lock()
-                                            .unwrap_or_else(|p| p.into_inner());
-                                        pending.remove(&rotation_id)
-                                    };
+                                    // Peek rather than remove (GitHub #1297 item 4):
+                                    // the old code removed the entry from the
+                                    // in-memory map up front, but on the
+                                    // NOT_FOUND/EXPIRED violation branches below
+                                    // the surrounding `batch` is never committed
+                                    // (nothing here ever put it back for those
+                                    // two cases), leaving the in-memory map and
+                                    // the Fjall `meta` entry disagreeing until
+                                    // restart. Only the genuine success arm below
+                                    // now removes it.
+                                    let entry = self
+                                        .pending_rotations
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .get(&rotation_id)
+                                        .cloned();
                                     match entry {
                                         None => {
                                             violations.push(Violation {
@@ -2537,12 +2720,6 @@ impl RaftStateMachine<TypeConfig> for Arc<FjallStateMachine> {
                                             });
                                         }
                                         Some(ref e) if e.initiator == confirmer => {
-                                            // Re-insert so it can still be confirmed by someone
-                                            // else within the window.
-                                            self.pending_rotations
-                                                .lock()
-                                                .unwrap_or_else(|p| p.into_inner())
-                                                .insert(rotation_id.clone(), e.clone());
                                             violations.push(Violation {
                                                 r#type: "UNAUTHORIZED".to_string(),
                                                 subject: rotation_id.clone(),
@@ -2554,6 +2731,13 @@ impl RaftStateMachine<TypeConfig> for Arc<FjallStateMachine> {
                                         }
                                         Some(entry) => {
                                             // Dual-control satisfied — execute DEK install.
+                                            // Removal from `pending` is deferred
+                                            // until the batch actually commits
+                                            // (see `pending_rotation_mutation`).
+                                            pending_rotation_mutation =
+                                                Some(PendingRotationMutation::Remove(
+                                                    rotation_id.clone(),
+                                                ));
                                             let meta_key =
                                                 format!("{PENDING_ROTATION_PREFIX}{rotation_id}");
                                             batch.remove(&self.meta, meta_key.as_bytes());
@@ -2690,6 +2874,22 @@ impl RaftStateMachine<TypeConfig> for Arc<FjallStateMachine> {
                     .commit()
                     .map_err(|e| io::Error::other(e.to_string()))?;
 
+                match pending_rotation_mutation {
+                    Some(PendingRotationMutation::Insert(id, entry)) => {
+                        self.pending_rotations
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(id, entry);
+                    }
+                    Some(PendingRotationMutation::Remove(id)) => {
+                        self.pending_rotations
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&id);
+                    }
+                    None => {}
+                }
+
                 // Swap the active DEK epoch after a successful InstallDek commit.
                 if let Some((new_epoch, is_emergency_rotation)) = pending_dek_swap {
                     let old_epoch = {
@@ -2743,6 +2943,9 @@ impl RaftStateMachine<TypeConfig> for Arc<FjallStateMachine> {
                 }
             }
 
+            // Not fsynced here (see the comment on `pending_responses`
+            // above) — folded into the single `persist(SyncAll)` below,
+            // covering every entry in this apply() call.
             self.meta
                 .insert(
                     KEY_LAST_APPLIED_LOG,
@@ -2751,19 +2954,18 @@ impl RaftStateMachine<TypeConfig> for Arc<FjallStateMachine> {
                 )
                 .map_err(|e| io::Error::other(e.to_string()))?;
 
-            self.db
-                .persist(PersistMode::SyncAll)
-                .map_err(|e| io::Error::other(e.to_string()))?;
-
             self.raft_prometheus_metrics
                 .apply_duration_seconds
                 .record(apply_start.elapsed().as_secs_f64());
 
             if let Some(responder) = responder {
-                responder.send(crate::ZeroizingResponse {
-                    value: response.0.map(zeroize::Zeroizing::new),
-                    violations: response.1,
-                });
+                pending_responses.push((
+                    responder,
+                    crate::ZeroizingResponse {
+                        value: response.0.map(zeroize::Zeroizing::new),
+                        violations: response.1,
+                    },
+                ));
             }
         }
 
@@ -2782,6 +2984,12 @@ impl RaftStateMachine<TypeConfig> for Arc<FjallStateMachine> {
         self.db
             .persist(PersistMode::SyncAll)
             .map_err(|e| io::Error::other(e.to_string()))?;
+
+        // Every entry in this apply() call is now durable — safe to
+        // notify callers.
+        for (responder, response) in pending_responses {
+            responder.send(response);
+        }
         Ok(())
     }
 }
@@ -3116,7 +3324,10 @@ mod dek_version_tests {
         let mut metadata = Metadata::new();
         metadata.dek_version = Some(dek_version1);
         sm.meta()
-            .insert(b"k1", metadata.pack().expect("pack metadata"))
+            .insert(
+                meta_key("data", b"k1"),
+                metadata.pack().expect("pack metadata"),
+            )
             .expect("insert metadata");
 
         // Rotate: k1's record is now under a retired epoch, exactly as it
@@ -3175,7 +3386,10 @@ mod dek_version_tests {
         let mut metadata = Metadata::new();
         metadata.dek_version = Some(dek_version);
         sm.meta()
-            .insert(b"k1", metadata.pack().expect("pack metadata"))
+            .insert(
+                meta_key("data", b"k1"),
+                metadata.pack().expect("pack metadata"),
+            )
             .expect("insert metadata");
 
         // QUARANTINE_THRESHOLD (3) identical failures within the sliding
@@ -3245,6 +3459,145 @@ mod dek_version_tests {
     }
 }
 
+/// Regression tests for GitHub #1294: per-record `Metadata` must be
+/// namespaced by keyspace, and callers must never be able to write
+/// directly into a keyspace reserved for the state machine's own storage.
+#[cfg(test)]
+mod keyspace_isolation_tests {
+    use openstack_keystone_storage_crypto::EnvKek;
+
+    use super::*;
+
+    fn test_epoch(seed: u8, version: u32) -> Arc<DekEpoch> {
+        Arc::new(DekEpoch::from_raw(LockedKey::from_raw([seed; 32]), version).expect("epoch"))
+    }
+
+    fn make_sm(current: Arc<DekEpoch>) -> (FjallStateMachine, tempfile::TempDir) {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let db = Arc::new(Database::builder(td.path()).open().expect("open db"));
+        let kek: Arc<dyn KekProvider> = Arc::new(EnvKek::from_bytes([0x42u8; 32]));
+        let (reencrypt_tx, reencrypt_rx) = tokio::sync::mpsc::channel(1);
+        drop(reencrypt_rx);
+        let (quarantine_tx, quarantine_rx) = tokio::sync::mpsc::channel(1);
+        drop(quarantine_rx);
+
+        let sm = FjallStateMachine::new(
+            db,
+            td.path().join("snapshots"),
+            1,
+            Arc::new(RwLock::new(current)),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(HashSet::new())),
+            kek,
+            reencrypt_tx,
+            quarantine_tx,
+            Arc::new(Mutex::new(HashMap::new())),
+        )
+        .expect("construct state machine");
+        (sm, td)
+    }
+
+    #[test]
+    fn meta_key_never_collides_across_keyspaces_or_with_bare_system_keys() {
+        // Two different keyspaces, same record key -> different meta keys.
+        assert_ne!(meta_key("data", b"shared"), meta_key("other", b"shared"));
+        // The `\0` separator can never be produced by a bare system key
+        // (none of them contain a NUL byte), so a namespaced meta key can
+        // never collide with one.
+        assert_ne!(meta_key("data", b"shared"), META_DEK_CURRENT.to_vec());
+        assert!(meta_key("data", b"shared").contains(&0u8));
+        assert!(!META_DEK_CURRENT.contains(&0u8));
+        assert!(!KEY_LAST_APPLIED_LOG.contains(&0u8));
+        assert!(!KEY_LAST_MEMBERSHIP.contains(&0u8));
+    }
+
+    #[test]
+    fn check_keyspace_allowed_rejects_only_reserved_names() {
+        for reserved in RESERVED_KEYSPACES {
+            assert!(
+                check_keyspace_allowed(reserved).is_err(),
+                "'{reserved}' must be rejected as a caller-supplied keyspace"
+            );
+        }
+        for ok in ["data", "identity_users", "oauth2_tokens"] {
+            assert!(
+                check_keyspace_allowed(ok).is_ok(),
+                "'{ok}' must be a valid caller-supplied keyspace"
+            );
+        }
+    }
+
+    /// Two records with the same key in different keyspaces must have
+    /// independent `Metadata`: writing/removing one must never affect the
+    /// other's revision, tier or `dek_version` (GitHub #1294 consequence
+    /// 1). This mirrors what `apply()`'s `Set`/`Remove` handlers now do via
+    /// `meta_key`.
+    #[test]
+    fn metadata_is_isolated_per_keyspace_for_the_same_record_key() {
+        let epoch = test_epoch(0x50, 1);
+        let (sm, _td) = make_sm(epoch);
+
+        let ks_a = sm.keyspace("keyspace_a").expect("keyspace a");
+        let ks_b = sm.keyspace("keyspace_b").expect("keyspace b");
+
+        let (cipher_a, dek_version_a) = sm
+            .encrypt_and_store(
+                &ks_a,
+                b"shared",
+                b"keyspace_a",
+                DataTier::Internal as u8,
+                b"a",
+            )
+            .expect("encrypt in keyspace_a");
+        ks_a.insert(b"shared", cipher_a).expect("insert a");
+        let mut meta_a = Metadata::new();
+        meta_a.revision = 7;
+        meta_a.dek_version = Some(dek_version_a);
+        sm.meta()
+            .insert(meta_key("keyspace_a", b"shared"), meta_a.pack().unwrap())
+            .expect("insert meta a");
+
+        let (cipher_b, dek_version_b) = sm
+            .encrypt_and_store(
+                &ks_b,
+                b"shared",
+                b"keyspace_b",
+                DataTier::Internal as u8,
+                b"b",
+            )
+            .expect("encrypt in keyspace_b");
+        ks_b.insert(b"shared", cipher_b).expect("insert b");
+        let mut meta_b = Metadata::new();
+        meta_b.revision = 3;
+        meta_b.dek_version = Some(dek_version_b);
+        sm.meta()
+            .insert(meta_key("keyspace_b", b"shared"), meta_b.pack().unwrap())
+            .expect("insert meta b");
+
+        // Removing keyspace_a's record (as apply()'s Remove handler does)
+        // must not touch keyspace_b's metadata.
+        sm.meta()
+            .remove(meta_key("keyspace_a", b"shared"))
+            .expect("remove meta a");
+
+        assert!(
+            sm.meta()
+                .get(meta_key("keyspace_a", b"shared"))
+                .expect("get a")
+                .is_none(),
+            "keyspace_a's metadata must be gone"
+        );
+        let meta_b_after = sm
+            .meta()
+            .get(meta_key("keyspace_b", b"shared"))
+            .expect("get b")
+            .expect("keyspace_b's metadata must survive keyspace_a's removal");
+        let unpacked_b = Metadata::unpack(meta_b_after.as_ref()).expect("unpack b");
+        assert_eq!(unpacked_b.revision, 3);
+        assert_eq!(unpacked_b.dek_version, Some(dek_version_b));
+    }
+}
+
 #[cfg(test)]
 mod reencrypt_tests {
     use openstack_keystone_storage_crypto::EnvKek;
@@ -3292,7 +3645,10 @@ mod reencrypt_tests {
         let mut metadata = Metadata::new();
         metadata.dek_version = Some(dek_version);
         sm.meta()
-            .insert(key, metadata.pack().expect("pack metadata"))
+            .insert(
+                meta_key("data", key),
+                metadata.pack().expect("pack metadata"),
+            )
             .expect("insert metadata");
         dek_version
     }
@@ -3326,7 +3682,7 @@ mod reencrypt_tests {
         // Metadata now names the new epoch.
         let meta_bytes = sm
             .meta()
-            .get(b"k1")
+            .get(meta_key("data", b"k1"))
             .expect("get meta")
             .expect("meta present");
         let metadata = Metadata::unpack(meta_bytes.as_ref()).expect("unpack metadata");
@@ -3574,7 +3930,11 @@ mod reencrypt_tests {
         );
         assert!(matches!(outcome, ReencryptOutcome::Migrated));
 
-        let meta_bytes = sm.meta().get(b"k1").expect("get meta").expect("present");
+        let meta_bytes = sm
+            .meta()
+            .get(meta_key("data", b"k1"))
+            .expect("get meta")
+            .expect("present");
         let metadata = Metadata::unpack(meta_bytes.as_ref()).expect("unpack metadata");
         assert_eq!(metadata.dek_version, Some(new_epoch.version));
     }
@@ -3631,7 +3991,7 @@ mod reencrypt_tests {
                 batch.insert(&ks, b"k1".to_vec(), ciphertext);
                 batch.insert(
                     sm_writer.meta(),
-                    b"k1".to_vec(),
+                    meta_key("data", b"k1"),
                     metadata.pack().expect("pack"),
                 );
                 batch.commit().expect("commit");
@@ -3650,7 +4010,11 @@ mod reencrypt_tests {
         writer.join().expect("writer thread must not panic");
         reencryptor.join().expect("reencrypt thread must not panic");
 
-        let meta_bytes = sm.meta().get(b"k1").expect("get meta").expect("present");
+        let meta_bytes = sm
+            .meta()
+            .get(meta_key("data", b"k1"))
+            .expect("get meta")
+            .expect("present");
         let metadata = Metadata::unpack(meta_bytes.as_ref()).expect("unpack metadata");
         assert_eq!(
             metadata.dek_version,
@@ -4207,6 +4571,95 @@ mod snapshot_tests {
         assert_eq!(
             dump(&sm, "data"),
             vec![(b"rec1".to_vec(), b"original".to_vec())]
+        );
+    }
+
+    /// Regression test for GitHub #1296 item 1: filenames are
+    /// `<leader_id>-<index>-<rand>`, and `"1-9-..." > "1-10-..."` as
+    /// strings, so picking the "latest" snapshot by lexicographically
+    /// greatest filename picks a stale one once the applied index crosses
+    /// a digit boundary. `latest_snapshot_path` must instead follow the
+    /// persisted write-order history, independent of filename content.
+    #[tokio::test]
+    async fn latest_snapshot_path_follows_write_order_not_filename_sort() {
+        let (sm, _td) = make_sm();
+
+        // Write a snapshot whose filename would lexicographically outrank
+        // one written after it, if selection were string-based.
+        sm.persist_snapshot_file("9-fake-later", b"first-payload")
+            .expect("write first snapshot file");
+        let first_path = sm.latest_snapshot_path().expect("lookup").expect("some");
+        assert_eq!(first_path.file_name().unwrap(), "9-fake-later");
+
+        sm.persist_snapshot_file("10-fake-newer", b"second-payload")
+            .expect("write second snapshot file");
+        let second_path = sm.latest_snapshot_path().expect("lookup").expect("some");
+        assert_eq!(
+            second_path.file_name().unwrap(),
+            "10-fake-newer",
+            "the more recently written snapshot must be picked even though its \
+             filename lexicographically sorts before the older one"
+        );
+    }
+
+    /// Regression test for GitHub #1296 item 2: snapshot files were never
+    /// garbage-collected, so every `build_snapshot` left a full copy of
+    /// the dataset on disk forever.
+    #[tokio::test]
+    async fn old_snapshot_files_are_garbage_collected_beyond_the_retained_history() {
+        let (sm, _td) = make_sm();
+
+        for i in 0..(SNAPSHOT_KEEP + 3) {
+            sm.persist_snapshot_file(&format!("snap-{i}"), b"payload")
+                .expect("write snapshot file");
+        }
+
+        let remaining: usize = fs::read_dir(sm.snapshot_dir())
+            .expect("read snapshot dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .count();
+        assert_eq!(
+            remaining, SNAPSHOT_KEEP,
+            "only the newest {SNAPSHOT_KEEP} snapshot files must survive on disk"
+        );
+    }
+
+    /// Regression test for GitHub #1296 item 3: a corrupt or undecryptable
+    /// newest snapshot file must not prevent startup outright —
+    /// `get_current_snapshot` must fall back to an older, still-valid
+    /// retained file.
+    #[tokio::test]
+    async fn get_current_snapshot_falls_back_to_an_older_file_if_newest_is_corrupt() {
+        let (mut sm, _td) = make_sm();
+        sm.data().insert(b"rec1", b"good-data").expect("seed data");
+
+        // First (older, still valid) snapshot.
+        let _ = sm.build_snapshot().await.expect("build first snapshot");
+
+        // Second (newest) snapshot, then corrupt it on disk in place.
+        let _ = sm.build_snapshot().await.expect("build second snapshot");
+        let newest_path = sm
+            .latest_snapshot_path()
+            .expect("lookup")
+            .expect("newest snapshot exists");
+        let mut bytes = fs::read(&newest_path).expect("read newest snapshot");
+        let tail = bytes.len() - 1;
+        bytes[tail] ^= 0xFF; // flip a ciphertext byte -> GCM tag no longer verifies
+        fs::write(&newest_path, &bytes).expect("corrupt newest snapshot");
+
+        let snapshot = sm
+            .get_current_snapshot()
+            .await
+            .expect("must not error out")
+            .expect("must fall back to the older, still-valid snapshot");
+        let payload: SnapshotPayload =
+            rmp_serde::from_slice(&snapshot.snapshot).expect("decode payload");
+        let by_name: HashMap<String, Vec<(Vec<u8>, Vec<u8>)>> =
+            payload.keyspaces.into_iter().collect();
+        assert_eq!(
+            by_name.get("data"),
+            Some(&vec![(b"rec1".to_vec(), b"good-data".to_vec())])
         );
     }
 }
