@@ -25,7 +25,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use openstack_keystone_config::Config;
+use openstack_keystone_config::ConfigView;
 
 use crate::api_key::ApiKeyProviderError;
 use crate::api_key::backend::ApiKeyBackend;
@@ -95,10 +95,10 @@ pub struct BackendRegistration<B: ?Sized + 'static> {
     /// Whether this driver should be built for the given configuration.
     /// Always-on drivers (most `sql`/`raft` backends) use `|_| true`;
     /// conditional drivers (e.g. `ldap`, `jws`) inspect `config`.
-    pub selected: fn(&Config) -> bool,
+    pub selected: fn(&ConfigView<'_>) -> bool,
     /// Constructs the backend. May perform real I/O (e.g. opening an
     /// LDAP connection, loading signing keys) and fail.
-    pub build: fn(&Config) -> BuildFuture<B>,
+    pub build: fn(&ConfigView<'_>) -> BuildFuture<B>,
 }
 
 /// Declares the `inventory` collection registry for one backend kind.
@@ -148,7 +148,7 @@ declare_backend_registry!(
 /// - Fails if two drivers of the same kind register under the same `name`
 ///   (ambiguous selection at lookup time).
 pub async fn register_backends<B: ?Sized>(
-    config: &Config,
+    config: &ConfigView<'_>,
     target: &mut HashMap<String, Arc<B>>,
 ) -> eyre::Result<()>
 where
@@ -181,7 +181,7 @@ pub struct NamedAssignmentBackendRegistration {
     /// Builds one instance from the named block. Reads `config.assignment
     /// .backend_block(block_name)` for its parameters; fails when the block is
     /// absent or names a different driver.
-    pub build: fn(config: &Config, block_name: &str) -> BuildFuture<dyn AssignmentBackend>,
+    pub build: fn(config: &ConfigView<'_>, block_name: &str) -> BuildFuture<dyn AssignmentBackend>,
 }
 
 inventory::collect!(NamedAssignmentBackendRegistration);
@@ -196,7 +196,7 @@ inventory::collect!(NamedAssignmentBackendRegistration);
 /// - [`AssignmentProviderError::Driver`] when more than one driver registered
 ///   under `driver`, or wrapping any error from the driver's constructor.
 pub async fn build_global_assignment_backend(
-    config: &Config,
+    config: &ConfigView<'_>,
     driver: &str,
 ) -> Result<Arc<dyn AssignmentBackend>, AssignmentProviderError> {
     let reg = single_registration(
@@ -243,7 +243,7 @@ fn single_registration<T>(
 /// - [`AssignmentProviderError::Driver`] when more than one driver registered
 ///   under `driver`, or wrapping any other construction failure.
 pub async fn build_named_assignment_backend(
-    config: &Config,
+    config: &ConfigView<'_>,
     driver: &str,
     block_name: &str,
 ) -> Result<Arc<dyn AssignmentBackend>, AssignmentProviderError> {
@@ -302,9 +302,12 @@ pub trait PluginManagerApi {
 
     /// Every registered assignment backend, keyed by driver name.
     ///
-    /// The assignment provider clones this to seed its per-domain dispatch
-    /// bundle (ADR 0034 §4); with the `openfga` driver crate linked it holds
-    /// both `"sql"` and `"openfga"`.
+    /// The assignment provider resolves the global backend through this map
+    /// (ADR 0034 §4). A driver appears here only when its `selected`
+    /// predicate holds: with the `openfga` driver crate linked, `"openfga"`
+    /// is present only when `[assignment] driver` is `openfga`. Per-domain
+    /// backends are built separately from the named blocks and are not part
+    /// of this map.
     ///
     /// # Returns
     /// - `&HashMap<String, Arc<dyn AssignmentBackend>>` - The registry.
@@ -846,7 +849,7 @@ pub trait PluginManagerApi {
 
 #[cfg(test)]
 mod tests {
-    use openstack_keystone_config::Config;
+    use openstack_keystone_config::{Config, LoadedConfig};
 
     use super::*;
 
@@ -854,7 +857,9 @@ mod tests {
     /// every name is unknown — the lookup must report it rather than panic.
     #[tokio::test]
     async fn build_global_assignment_backend_rejects_an_unknown_driver() {
-        match build_global_assignment_backend(&Config::default(), "nope").await {
+        match build_global_assignment_backend(&LoadedConfig::new(Config::default()).view(), "nope")
+            .await
+        {
             Err(AssignmentProviderError::UnsupportedDriver(name)) => assert_eq!(name, "nope"),
             other => panic!("expected UnsupportedDriver, got {:?}", other.err()),
         }
@@ -862,7 +867,13 @@ mod tests {
 
     #[tokio::test]
     async fn build_named_assignment_backend_rejects_an_unknown_driver() {
-        match build_named_assignment_backend(&Config::default(), "nope", "block").await {
+        match build_named_assignment_backend(
+            &LoadedConfig::new(Config::default()).view(),
+            "nope",
+            "block",
+        )
+        .await
+        {
             Err(AssignmentProviderError::UnsupportedDriver(name)) => assert_eq!(name, "nope"),
             other => panic!("expected UnsupportedDriver, got {:?}", other.err()),
         }

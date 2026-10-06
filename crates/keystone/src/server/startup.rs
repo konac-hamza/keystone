@@ -33,6 +33,7 @@ use tracing::{debug, info};
 use crate::config::Config;
 use openstack_keystone_core::keystone::ServiceState;
 use openstack_keystone_distributed_storage::app::Storage;
+use openstack_keystone_distributed_storage::config::DistributedStorageConfiguration;
 
 pub mod args;
 pub mod audit;
@@ -53,6 +54,9 @@ pub struct Startup {
     /// The fully resolved configuration snapshot taken at startup. Live
     /// reloads are observed through `state.config_manager`, not this copy.
     pub cfg: Config,
+    /// The `[distributed_storage]` section of the startup snapshot, when
+    /// distributed storage is configured.
+    pub distributed_storage: Option<DistributedStorageConfiguration>,
     /// Process-wide shutdown signal. Cancelled by the signal watcher or by
     /// any listener task that exits/fails.
     pub token: CancellationToken,
@@ -83,6 +87,12 @@ pub async fn run() -> Result<(), Report> {
     if let Some(dump_format) = &args.dump_openapi {
         return args::dump_openapi(dump_format, &openapi);
     }
+
+    // Catch a driver section whose registration the linker dropped (ADR 0018,
+    // ADR 0039) before the configuration is loaded without it.
+    oslo_config::assert_registered(&["jws_tokens", "distributed_storage"])?;
+    #[cfg(feature = "openfga")]
+    oslo_config::assert_registered(&["openfga"])?;
 
     let cfg_mgr = crate::config::ConfigManager::watched(args.config.clone()).await?;
     let cfg = cfg_mgr.config.read().await.clone();
@@ -187,6 +197,7 @@ pub(crate) mod test_support {
         let state = test_state(cfg.clone()).await;
         Startup {
             cfg,
+            distributed_storage: None,
             token: CancellationToken::new(),
             state,
             concrete_storage: None,

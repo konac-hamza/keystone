@@ -5018,6 +5018,7 @@ dependencies = [
  "openstack-keystone-token-restriction-driver-sql",
  "openstack-keystone-trust-driver-sql",
  "openstack-keystone-webauthn",
+ "oslo-config",
  "pem 4.0.0",
  "rand 0.10.2",
  "rcgen",
@@ -5118,6 +5119,7 @@ name = "openstack-keystone-assignment-driver-openfga"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "config",
  "eyre",
  "futures",
  "httpmock",
@@ -5125,9 +5127,11 @@ dependencies = [
  "openstack-keystone-config",
  "openstack-keystone-core",
  "openstack-keystone-core-types",
+ "oslo-config",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -5228,6 +5232,7 @@ dependencies = [
  "openstack-keystone-token-driver-fernet",
  "openstack-keystone-token-restriction-driver-sql",
  "openstack-keystone-webauthn",
+ "oslo-config",
  "reqwest",
  "rustls",
  "sea-orm",
@@ -5252,14 +5257,11 @@ dependencies = [
  "cadf",
  "chrono",
  "config",
- "derive_builder",
  "eyre",
  "http",
- "http-serde",
- "httpmock",
  "ipnet",
  "log",
- "notify",
+ "oslo-config",
  "regex",
  "secrecy",
  "serde",
@@ -5269,12 +5271,10 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
- "tokio-util",
  "tracing",
  "url",
  "url-macro",
  "validator",
- "vaultrs",
 ]
 
 [[package]]
@@ -5309,6 +5309,7 @@ dependencies = [
  "openstack-keystone-local-emergency-store",
  "openstack-keystone-metrics",
  "openstack-keystone-storage-api",
+ "oslo-config",
  "p256 0.14.0",
  "percent-encoding",
  "proptest",
@@ -5387,6 +5388,7 @@ dependencies = [
  "async-trait",
  "byteorder",
  "chrono",
+ "config",
  "criterion",
  "cryptoki",
  "dashmap",
@@ -5395,6 +5397,7 @@ dependencies = [
  "futures",
  "governor",
  "http",
+ "http-serde",
  "hyper-util",
  "mockall",
  "nix 0.31.3",
@@ -5406,6 +5409,7 @@ dependencies = [
  "openstack-keystone-storage-crypto",
  "openstack-keystone-storage-crypto-pkcs11",
  "openstack-keystone-storage-crypto-tpm",
+ "oslo-config",
  "prost",
  "rand 0.10.2",
  "rcgen",
@@ -5434,6 +5438,7 @@ dependencies = [
  "tracing-subscriber",
  "tracing-test",
  "uuid",
+ "validator",
  "x509-parser 0.18.1",
  "zeroize",
 ]
@@ -5895,6 +5900,7 @@ dependencies = [
  "openstack-keystone-core",
  "openstack-keystone-core-types",
  "openstack-keystone-key-repository",
+ "oslo-config",
  "p256 0.14.0",
  "rsa",
  "secrecy",
@@ -6445,6 +6451,33 @@ checksum = "49203cdcae0030493bad186b28da2fa25645fa276a51b6fec8010d281e02ef79"
 dependencies = [
  "dlv-list",
  "hashbrown 0.14.5",
+]
+
+[[package]]
+name = "oslo-config"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "config",
+ "derive_builder",
+ "eyre",
+ "httpmock",
+ "inventory",
+ "ipnet",
+ "notify",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "temp-env",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-test",
+ "url",
+ "vaultrs",
 ]
 
 [[package]]
@@ -9153,6 +9186,7 @@ version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96374855068f47402c3121c6eed88d29cb1de8f3ab27090e273e420bdabcf050"
 dependencies = [
+ "futures",
  "parking_lot",
 ]
 
@@ -9264,6 +9298,7 @@ dependencies = [
  "jsonwebtoken",
  "openstack-keystone",
  "openstack-keystone-api-types",
+ "openstack-keystone-assignment-driver-openfga",
  "openstack-keystone-config",
  "openstack-keystone-core",
  "openstack-keystone-core-types",
@@ -9275,6 +9310,7 @@ dependencies = [
  "openstack-keystone-storage-api",
  "openstack-keystone-token-driver-fernet",
  "openstack-keystone-trust-driver-sql",
+ "oslo-config",
  "rcgen",
  "sea-orm",
  "secrecy",

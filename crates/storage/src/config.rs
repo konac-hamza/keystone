@@ -11,16 +11,26 @@
 // limitations under the License.
 //
 // SPDX-License-Identifier: Apache-2.0
+//! # Distributed storage configuration
+//!
+//! The `[distributed_storage]` section. It is owned by the storage crate and
+//! registered with the configuration engine (ADR 0039), so the Keystone
+//! schema crate does not know about it. Read it with
+//! `view.section::<DistributedStorageConfiguration>()`; it is absent when the
+//! deployment does not configure distributed storage.
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use eyre::{Context, Report};
 use http::Uri;
+use openstack_keystone_config::{ConfigManager, LoadedConfig};
+use oslo_config::{ConfigError, ConfigSection, LoadCtx, SectionBag, register_section};
 use secrecy::SecretSlice;
 use serde::Deserialize;
 use validator::Validate;
 
-use crate::common::{TlsConfiguration, csv, option_u32_from_str_or_int};
+use oslo_config::{TlsConfiguration, csv, option_u32_from_str_or_int};
 
 /// Raft cluster configuration.
 #[derive(Debug, Deserialize, Clone, Validate)]
@@ -541,6 +551,71 @@ impl SpiffeTls {
     }
 }
 
+impl ConfigSection for DistributedStorageConfiguration {
+    const NAME: &'static str = "distributed_storage";
+
+    fn finish(&mut self, _ctx: &LoadCtx) -> Result<(), ConfigError> {
+        if let RaftTlsConfiguration::Tls(ref mut tls) = self.tls_configuration {
+            tls.read_certs()
+                .wrap_err("reading distributed storage TLS configuration")?;
+        }
+        if let Some(ref mut pkcs11) = self.pkcs11 {
+            pkcs11
+                .load_secrets()
+                .wrap_err("reading distributed storage PKCS#11 configuration")?;
+        }
+        if let Some(ref mut tpm) = self.tpm {
+            tpm.load_secrets()
+                .wrap_err("reading distributed storage TPM configuration")?;
+        }
+        Ok(())
+    }
+
+    fn validate_with(&self, _sections: &SectionBag) -> Result<(), ConfigError> {
+        self.validate()
+            .wrap_err("validating [distributed_storage] section")
+    }
+
+    fn watch_files(&self) -> Vec<PathBuf> {
+        match &self.tls_configuration {
+            RaftTlsConfiguration::Tls(tls) => [
+                &tls.tls_cert_file,
+                &tls.tls_key_file,
+                &tls.tls_client_ca_file,
+            ]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+register_section!(DistributedStorageConfiguration);
+
+/// Build an unwatched [`ConfigManager`] around a default core configuration
+/// and the given `[distributed_storage]` section.
+///
+/// A manager made with `ConfigManager::not_watched(Config)` has an empty
+/// section bag, so tests and benches that need the section use this instead.
+pub fn config_manager(ds: DistributedStorageConfiguration) -> Arc<ConfigManager> {
+    config_manager_with(openstack_keystone_config::Config::default(), Some(ds))
+}
+
+/// Like [`config_manager`], with a prepared core configuration and an
+/// optional `[distributed_storage]` section.
+pub fn config_manager_with(
+    config: openstack_keystone_config::Config,
+    ds: Option<DistributedStorageConfiguration>,
+) -> Arc<ConfigManager> {
+    let mut sections = SectionBag::default();
+    if let Some(ds) = ds {
+        sections.insert(ds);
+    }
+    ConfigManager::not_watched_loaded(LoadedConfig::with_sections(config, sections))
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -697,48 +772,6 @@ allowed_peer_svids = ["spiffe://example.org/ns/default/sa/keystone"]
             trust_domains: vec!["example.org".to_string()],
         };
         assert_eq!(custom.own_svid_path(), "/custom/raft/node");
-    }
-
-    #[test]
-    fn test_env() {
-        // `Config::new` is async, but this test drives it from the synchronous
-        // `temp_env::with_vars` closure API, so run it to completion on a local
-        // current-thread runtime.
-        temp_env::with_vars(
-            [(
-                "OS_DISTRIBUTED_STORAGE__NODE_CLUSTER_ADDR",
-                Some("http://test/"),
-            )],
-            || {
-                let mut cfg_file = NamedTempFile::new().unwrap();
-                write!(
-                    cfg_file,
-                    r#"
-[auth]
-methods = []
-[database]
-connection = "foo"
-[distributed_storage]
-node_id = 5
-path = /foo
-            "#
-                )
-                .unwrap();
-
-                let cfg = tokio::runtime::Builder::new_current_thread()
-                    .build()
-                    .unwrap()
-                    .block_on(crate::Config::new(cfg_file.path().to_path_buf()))
-                    .unwrap();
-                assert_eq!(
-                    "http://test/",
-                    cfg.distributed_storage
-                        .expect("must be present")
-                        .node_cluster_addr
-                        .to_string()
-                );
-            },
-        );
     }
 
     #[test]

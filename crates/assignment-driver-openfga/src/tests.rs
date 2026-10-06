@@ -24,8 +24,11 @@ use serde_json::json;
 use tracing_test::traced_test;
 use url::Url;
 
-use openstack_keystone_config::{Config, OpenFGAAssignmentDriver, OpenFGAIdTransform};
-use openstack_keystone_core::tests::get_mocked_state;
+use openstack_keystone_config::{Config, LoadedConfig};
+use openstack_keystone_core::tests::{get_mocked_state, get_mocked_state_loaded};
+use oslo_config::{ParsedSection, SectionBag};
+
+use crate::config::{OpenFGAAssignmentDriver, OpenFGAIdTransform};
 
 use super::*;
 
@@ -52,11 +55,13 @@ fn driver_config(host: &str) -> OpenFGAAssignmentDriver {
 }
 
 async fn state_with(cfg: OpenFGAAssignmentDriver) -> ServiceState {
-    let config = Config {
-        openfga: Some(cfg),
-        ..Default::default()
-    };
-    get_mocked_state(Some(config), None).await
+    let mut sections = SectionBag::default();
+    sections.insert(cfg);
+    get_mocked_state_loaded(
+        LoadedConfig::with_sections(Config::default(), sections),
+        None,
+    )
+    .await
 }
 
 fn driver() -> OpenFGADriver {
@@ -1443,7 +1448,10 @@ async fn build_named_assignment_backend_builds_the_openfga_block() -> Result<()>
     let mut config = Config::default();
     config.assignment.backends.insert(
         "central_fga".to_string(),
-        AssignmentBackendConfig::Openfga(Box::new(block)),
+        AssignmentBackendConfig::Named {
+            driver: "openfga".to_string(),
+            config: ParsedSection::new(block),
+        },
     );
 
     let state = get_mocked_state(Some(Config::default()), None).await;
@@ -1454,9 +1462,10 @@ async fn build_named_assignment_backend_builds_the_openfga_block() -> Result<()>
         })
         .await;
 
-    let backend = build_named_assignment_backend(&config, "openfga", "central_fga")
-        .await
-        .expect("the block builds");
+    let backend =
+        build_named_assignment_backend(&LoadedConfig::new(config).view(), "openfga", "central_fga")
+            .await
+            .expect("the block builds");
     assert!(
         backend
             .check_grant(&state, &user_project_assignment("a", "role_id", "t"))
@@ -1470,7 +1479,13 @@ async fn build_named_assignment_backend_builds_the_openfga_block() -> Result<()>
 async fn build_named_assignment_backend_rejects_a_missing_block() {
     use openstack_keystone_core::plugin_manager::build_named_assignment_backend;
 
-    match build_named_assignment_backend(&Config::default(), "openfga", "nope").await {
+    match build_named_assignment_backend(
+        &LoadedConfig::new(Config::default()).view(),
+        "openfga",
+        "nope",
+    )
+    .await
+    {
         Err(AssignmentProviderError::NamedBackendMisconfigured(msg)) => {
             assert!(
                 msg.contains("[assignment.backends.nope] is not defined"),
@@ -1494,7 +1509,9 @@ async fn build_named_assignment_backend_rejects_a_non_openfga_block() {
         .backends
         .insert("central".to_string(), AssignmentBackendConfig::Sql);
 
-    match build_named_assignment_backend(&config, "openfga", "central").await {
+    match build_named_assignment_backend(&LoadedConfig::new(config).view(), "openfga", "central")
+        .await
+    {
         Err(AssignmentProviderError::NamedBackendMisconfigured(msg)) => assert!(
             msg.contains("[assignment.backends.central] has driver `sql`, not `openfga`"),
             "{msg}"
@@ -1529,5 +1546,50 @@ async fn send_does_not_retry_client_error() -> Result<()> {
 
     assert!(matches!(err, AssignmentProviderError::Driver(_)));
     assert_eq!(m.calls_async().await, 1);
+    Ok(())
+}
+
+/// Backends selected by `cfg` as the registry builds them.
+async fn registered_assignment_backends(
+    view: &openstack_keystone_config::ConfigView<'_>,
+) -> eyre::Result<HashMap<String, Arc<dyn AssignmentBackend>>> {
+    let mut backends = HashMap::new();
+    openstack_keystone_core::plugin_manager::register_backends::<dyn AssignmentBackend>(
+        view,
+        &mut backends,
+    )
+    .await?;
+    Ok(backends)
+}
+
+#[tokio::test]
+async fn global_driver_not_selected_needs_no_section() -> Result<()> {
+    let loaded = LoadedConfig::new(Config::default());
+    let backends = registered_assignment_backends(&loaded.view()).await?;
+    assert!(!backends.contains_key("openfga"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn global_driver_selected_without_section_fails_the_build() {
+    let mut config = Config::default();
+    config.assignment.driver = "openfga".into();
+    let loaded = LoadedConfig::new(config);
+    let err = registered_assignment_backends(&loaded.view())
+        .await
+        .err()
+        .expect("a selected driver without its section must not build");
+    assert!(err.to_string().contains("[openfga]"), "{err}");
+}
+
+#[tokio::test]
+async fn global_driver_selected_with_section_builds() -> Result<()> {
+    let mut config = Config::default();
+    config.assignment.driver = "openfga".into();
+    let mut sections = SectionBag::default();
+    sections.insert(driver_config("http://fga:8080/"));
+    let loaded = LoadedConfig::with_sections(config, sections);
+    let backends = registered_assignment_backends(&loaded.view()).await?;
+    assert!(backends.contains_key("openfga"));
     Ok(())
 }
