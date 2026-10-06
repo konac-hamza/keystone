@@ -13,9 +13,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Sanitization helpers for audit field values.
 //!
-//! All functions in this module are `pub(crate)` — consumers of the audit
-//! crate construct typed values via the public builder API; raw sanitization
-//! is an implementation detail.
+//! The typed constructors (`Target::new`, `Observer::new`,
+//! `CadfEventPayload::new`) apply [`sanitize_audit_value`] internally, so
+//! values that reach the wire through them are already reduced. Emitters that
+//! construct untyped values apply the raw helpers directly;
+//! [`sanitize_audit_id`] adds the stricter UUID-or-`"unknown"` rule on top.
 
 /// Kind of pre-auth identity signal carried in `Initiator.host`.
 pub enum HostKind {
@@ -32,9 +34,9 @@ pub enum HostKind {
 /// Sanitize a resource / principal UUID for use in audit records.
 ///
 /// Strips everything except hex digits and hyphens, caps at 64 characters,
-/// then accepts either of the two UUID renderings Keystone actually produces:
-/// canonical hyphenated (len 36, hyphens at positions 8/13/18/23, 32 hex
-/// digits) or simple/no-hyphen (`Uuid::simple()`, exactly 32 hex digits, no
+/// then accepts either of the two UUID renderings the service actually
+/// produces: canonical hyphenated (len 36, hyphens at positions 8/13/18/23, 32
+/// hex digits) or simple/no-hyphen (`Uuid::simple()`, exactly 32 hex digits, no
 /// hyphens) — which is the format `Uuid::new_v4().simple()` produces and is
 /// used for every resource ID minted across the codebase (projects, users,
 /// roles, tokens, etc.). Returns `"unknown"` for anything that fails both
@@ -63,6 +65,32 @@ pub fn sanitize_audit_id(id: &str) -> String {
         cleaned
     } else {
         "unknown".to_string()
+    }
+}
+
+/// Reduce a free-form audit value to the audit-safe character set.
+///
+/// Keeps `[A-Za-z0-9._:+/-]` (at most 255 characters) and drops everything
+/// else, so newlines, control characters and other free text can never reach
+/// a signed record. An empty result becomes `"unknown"`.
+///
+/// This is the floor guarantee: the typed constructors
+/// (`Target::new`, `Observer::new`, `CadfEventPayload::new`) apply it, so
+/// every value that reaches the wire through them is reduced. Emitters that
+/// want a stricter convention (UUID-or-`"unknown"` for resource ids) apply
+/// [`sanitize_audit_id`] on top, before constructing the typed value.
+#[must_use]
+pub fn sanitize_audit_value(value: &str) -> String {
+    const MAX_LEN: usize = 255;
+    let cleaned: String = value
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '+' | '/' | '-'))
+        .take(MAX_LEN)
+        .collect();
+    if cleaned.is_empty() {
+        "unknown".to_string()
+    } else {
+        cleaned
     }
 }
 
@@ -160,7 +188,7 @@ mod tests {
     #[test]
     fn thirty_two_hex_chars_but_not_uuid_shape_still_passes() {
         // Any 32-char pure-hex string is accepted as "simple UUID" shaped;
-        // this is intentional since Keystone doesn't validate UUID version
+        // this is intentional since the service doesn't validate UUID version
         // bits elsewhere either.
         let id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         assert_eq!(sanitize_audit_id(id), id);
@@ -196,6 +224,38 @@ mod tests {
             sanitize_audit_id("550e840-0e29b-41d4a-716446-655440000a"),
             "unknown"
         );
+    }
+
+    // ---- sanitize_audit_value ----
+
+    #[test]
+    fn value_keeps_the_audit_charset() {
+        assert_eq!(sanitize_audit_value("abcXYZ0123._:+/-"), "abcXYZ0123._:+/-");
+        // RFC3339 timestamps and type URIs pass through untouched.
+        assert_eq!(
+            sanitize_audit_value("2026-06-16T00:00:00+00:00"),
+            "2026-06-16T00:00:00+00:00"
+        );
+        assert_eq!(
+            sanitize_audit_value("service/security/keystone/node-1"),
+            "service/security/keystone/node-1"
+        );
+    }
+
+    #[test]
+    fn value_drops_everything_else() {
+        assert_eq!(sanitize_audit_value("a\nb\tc\x00d\u{0430}e"), "abcde");
+    }
+
+    #[test]
+    fn value_empty_becomes_unknown() {
+        assert_eq!(sanitize_audit_value(""), "unknown");
+        assert_eq!(sanitize_audit_value("\n\t "), "unknown");
+    }
+
+    #[test]
+    fn value_caps_at_255() {
+        assert_eq!(sanitize_audit_value(&"a".repeat(300)).len(), 255);
     }
 
     // ---- sanitize_initiator_host ----

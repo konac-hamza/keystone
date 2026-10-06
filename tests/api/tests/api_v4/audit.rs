@@ -17,19 +17,18 @@
 //! nextest profile), performs real actions, and then reads the audit spool
 //! that server writes:
 //!
-//! 1. Password login as admin — a perimeter record on the best-effort
-//!    channel (`POST /v3/auth/tokens` is an authentication surface, so the
-//!    completion middleware records it even though no provider operation
-//!    runs).
-//! 2. User create + delete — provider records on the fail-closed channel:
-//!    one `pending` line and one terminal line per operation
+//! 1. Password login as admin — a perimeter record on the best-effort channel
+//!    (`POST /v3/auth/tokens` is an authentication surface, so the completion
+//!    middleware records it even though no provider operation runs).
+//! 2. User create + delete — provider records on the fail-closed channel: one
+//!    `pending` line and one terminal line per operation
 //!    (`crates/core/src/identity/service.rs`, `audited_op!`).
 //! 3. API key create + revoke — provider records; the revoke handler
-//!    (`crates/keystone/src/api/v4/api_key/revoke.rs`) has no audit call of
-//!    its own, the record is written in the provider
-//!    (`crates/core/src/api_key/service.rs`) via `audited_if_ctx!`, which
-//!    only audits when an execution context is present, so a mocked handler
-//!    test cannot observe it. A live request is the only way to cover it.
+//!    (`crates/keystone/src/api/v4/api_key/revoke.rs`) has no audit call of its
+//!    own, the record is written in the provider
+//!    (`crates/core/src/api_key/service.rs`) via `audited_if_ctx!`, which only
+//!    audits when an execution context is present, so a mocked handler test
+//!    cannot observe it. A live request is the only way to cover it.
 //!
 //! The spool is written asynchronously and is not fsynced per perimeter
 //! record, so the expected lines are polled for. The test skips (rather
@@ -41,11 +40,11 @@
 //! key derived from the keyring file, exactly as a SIEM would verify it (see
 //! `crates/cadf/tests/hmac_vectors.rs` for the reference procedure).
 //!
-//! `tools/start-api.sh` writes `[audit] spool_dir = /tmp/nextest/keystone/audit`
-//! and `node_id = api-test-node` and leaves `hmac_kek_file` unset, so the
-//! keyring sits at the legacy default `<spool_dir>/hmac-key.bin` (see
-//! `AuditConfig::hmac_kek_path`). `AUDIT_SPOOL_DIR` overrides the spool
-//! directory for manual runs.
+//! `tools/start-api.sh` writes `[audit] spool_dir =
+//! /tmp/nextest/keystone/audit` and `node_id = api-test-node` and leaves
+//! `hmac_kek_file` unset, so the keyring sits at the legacy default
+//! `<spool_dir>/hmac-key.bin` (see `AuditConfig::hmac_kek_path`).
+//! `AUDIT_SPOOL_DIR` overrides the spool directory for manual runs.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -53,7 +52,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cadf::{
-    AuditDispatcher, CadfEvent, CadfEventPayload, HmacKeyring, Initiator, Observer,
+    AuditDispatcher, CadfEvent, CadfEventPayload, HmacKeyring, Initiator, Observer, Outcome,
     ServiceIdentity, Target, derive_audit_hmac_key,
 };
 use eyre::{Result, bail, eyre};
@@ -173,16 +172,16 @@ fn find_pair<'a>(
     for event in events {
         let payload = event.payload();
         if payload.action() != action
-            || payload.target().type_uri != type_uri
-            || payload.target().id != target_id
+            || payload.target().type_uri() != type_uri
+            || payload.target().id() != target_id
         {
             continue;
         }
         match payload.outcome() {
-            "pending" => {
+            Outcome::Pending => {
                 pending.get_or_insert(event);
             }
-            "success" => {
+            Outcome::Success => {
                 success.get_or_insert(event);
             }
             _ => {}
@@ -296,8 +295,8 @@ async fn find_admin_user_id(admin: &Arc<AsyncOpenStack>) -> Result<String> {
 fn is_admin_login_success(event: &CadfEvent, admin_id: &str) -> bool {
     let payload = event.payload();
     payload.action() == "authenticate"
-        && payload.outcome() == "success"
-        && payload.target().type_uri == AUTH_TYPE_URI
+        && payload.outcome() == Outcome::Success
+        && payload.target().type_uri() == AUTH_TYPE_URI
         && payload.initiator().id() == admin_id
 }
 
@@ -457,17 +456,11 @@ async fn test_tampered_spool_line_fails_verification() -> Result<()> {
         "req-tamper".to_string(),
         "2026-10-06T00:00:00+00:00".to_string(),
         "delete".to_string(),
-        "success".to_string(),
+        Outcome::Success,
         None,
         Initiator::new("unknown".to_string(), None, None, None),
-        Target {
-            id: "00000000-0000-0000-0000-000000000000".to_string(),
-            type_uri: USER_TYPE_URI.to_string(),
-        },
-        Observer {
-            node_id: "tamper-node".to_string(),
-            id: "service/security/keystone/tamper-node".to_string(),
-        },
+        Target::new("00000000-0000-0000-0000-000000000000", USER_TYPE_URI),
+        Observer::new("tamper-node", "service/security/keystone/tamper-node"),
     );
     let event = payload.sign(&dispatcher);
     let line = serde_json::to_string(&event)?;

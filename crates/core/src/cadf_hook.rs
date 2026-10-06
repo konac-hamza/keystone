@@ -24,7 +24,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use cadf::sanitize::sanitize_audit_id;
-use cadf::{AuditDispatcher, CadfEventPayload, Initiator, Observer, OutcomeReason, Target};
+use cadf::{
+    AuditDispatcher, CadfEventPayload, Initiator, Observer, Outcome, OutcomeReason, Target,
+};
 use openstack_keystone_core_types::auth::{PrincipalInfo, ScopeInfo};
 use openstack_keystone_core_types::events::{Event, EventPayload, Operation};
 use uuid::Uuid;
@@ -154,10 +156,7 @@ fn build_target_from_event(event: &Event) -> Target {
             (keystone_id, "data/security/identity/scim-index")
         }
     };
-    Target {
-        id: sanitize_audit_id(raw_id),
-        type_uri: type_uri.to_string(),
-    }
+    Target::new(sanitize_audit_id(raw_id), type_uri)
 }
 
 /// Build an [`Initiator`] from a fully resolved [`ValidatedSecurityContext`].
@@ -226,11 +225,11 @@ pub fn with_request_address(initiator: Initiator) -> Initiator {
     initiator.with_address(crate::audit_context::client_ip().map(|ip| ip.to_string()))
 }
 
-fn outcome_str(outcome: &AuditOutcome) -> &'static str {
+fn cadf_outcome(outcome: &AuditOutcome) -> Outcome {
     match outcome {
-        AuditOutcome::Attempt => "pending",
-        AuditOutcome::Success => "success",
-        AuditOutcome::Failure { .. } => "failure",
+        AuditOutcome::Attempt => Outcome::Pending,
+        AuditOutcome::Success => Outcome::Success,
+        AuditOutcome::Failure { .. } => Outcome::Failure,
     }
 }
 
@@ -274,14 +273,14 @@ impl AuditHook for CadfAuditHook {
             ctx.correlation_id().to_string(),
             event.timestamp.to_rfc3339(),
             map_event_to_action(event),
-            outcome_str(outcome).to_string(),
+            cadf_outcome(outcome),
             outcome_reason(outcome),
             build_initiator_from_vsc(ctx),
             build_target_from_event(event),
-            Observer {
-                node_id: node_id.clone(),
-                id: format!("service/security/keystone/{node_id}"),
-            },
+            Observer::new(
+                node_id.clone(),
+                format!("service/security/keystone/{node_id}"),
+            ),
         );
         let signed = payload.sign(&self.dispatcher);
         match self.dispatcher.dispatch_critical(signed).await {
@@ -405,8 +404,8 @@ mod tests {
             },
         );
         let target = build_target_from_event(&e);
-        assert_eq!(target.id, "unknown");
-        assert_eq!(target.type_uri, "data/security/identity/user");
+        assert_eq!(target.id(), "unknown");
+        assert_eq!(target.type_uri(), "data/security/identity/user");
     }
 
     #[test]
@@ -484,7 +483,7 @@ mod tests {
         .unwrap();
 
         let attempt = rx.critical.try_recv().unwrap();
-        assert_eq!(attempt.payload().outcome(), "pending");
+        assert_eq!(attempt.payload().outcome(), Outcome::Pending);
         assert_eq!(attempt.payload().action(), "delete");
         assert_eq!(
             attempt.payload().initiator().id(),
@@ -492,7 +491,7 @@ mod tests {
         );
         assert!(dispatcher.verify_hmac(&attempt, &key));
         let failure = rx.critical.try_recv().unwrap();
-        assert_eq!(failure.payload().outcome(), "failure");
+        assert_eq!(failure.payload().outcome(), Outcome::Failure);
         assert!(failure.seq() > attempt.seq());
         assert!(
             rx.perimeter.try_recv().is_err(),
@@ -548,8 +547,8 @@ mod tests {
             ),
         ] {
             let target = build_target_from_event(&Event::new(Operation::Create, payload));
-            assert_eq!(target.type_uri, type_uri);
-            assert_eq!(target.id, id);
+            assert_eq!(target.type_uri(), type_uri);
+            assert_eq!(target.id(), id);
         }
     }
 

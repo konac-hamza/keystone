@@ -37,7 +37,7 @@ use openstack_keystone_core_types::mapping::auth::MappingAuthRequest;
 use openstack_keystone_core_types::mapping::resolution::IdentitySource;
 
 use crate::auth::ExecutionContext;
-use cadf::OutcomeReason;
+use cadf::{Outcome, OutcomeReason};
 
 use crate::auth_plugin::{emit_wasm_plugin_audit, emit_wasm_route_audit};
 use crate::keystone::ServiceState;
@@ -57,10 +57,11 @@ pub struct WasmPluginAuthRequest {
     /// Raw public-interface TCP peer address. Internal/admin callers pass
     /// `None` even when their listener records a peer for audit logging.
     pub peer_ip: Option<std::net::IpAddr>,
-    /// The request's server-generated correlation ID (`x-openstack-request-id`),
-    /// so the plugin audit records can be joined with the perimeter event of
-    /// the same login. `None` for callers without a request (tests, internal
-    /// dispatch); the record then gets a fresh ID.
+    /// The request's server-generated correlation ID
+    /// (`x-openstack-request-id`), so the plugin audit records can be
+    /// joined with the perimeter event of the same login. `None` for
+    /// callers without a request (tests, internal dispatch); the record
+    /// then gets a fresh ID.
     pub correlation_id: Option<String>,
 }
 
@@ -155,7 +156,7 @@ pub async fn authenticate_via_wasm_plugin(
             correlation_id.as_deref(),
             plugin_name,
             "authenticate",
-            "rate_limited",
+            Outcome::Failure,
             Some(OutcomeReason::literal(bound.as_str())),
         )
         .await;
@@ -170,7 +171,7 @@ pub async fn authenticate_via_wasm_plugin(
             correlation_id.as_deref(),
             plugin_name,
             "authenticate",
-            "rate_limited",
+            Outcome::Failure,
             Some(OutcomeReason::literal(bound.as_str())),
         )
         .await;
@@ -187,7 +188,7 @@ pub async fn authenticate_via_wasm_plugin(
                 correlation_id.as_deref(),
                 plugin_name,
                 "authenticate",
-                "rate_limited",
+                Outcome::Failure,
                 Some(OutcomeReason::literal(bound.as_str())),
             )
             .await;
@@ -257,7 +258,7 @@ pub async fn authenticate_via_wasm_plugin(
                 correlation_id.as_deref(),
                 plugin_name,
                 "authenticate",
-                "failure",
+                Outcome::Failure,
                 Some(OutcomeReason::literal("InvokeFailed")),
             )
             .await;
@@ -274,7 +275,7 @@ pub async fn authenticate_via_wasm_plugin(
                     correlation_id.as_deref(),
                     plugin_name,
                     "authenticate",
-                    "failure",
+                    Outcome::Failure,
                     Some(OutcomeReason::literal("MalformedResponse")),
                 )
                 .await;
@@ -289,7 +290,7 @@ pub async fn authenticate_via_wasm_plugin(
                 correlation_id.as_deref(),
                 plugin_name,
                 "authenticate",
-                "failure",
+                Outcome::Failure,
                 Some(OutcomeReason::literal("PluginDenied")),
             )
             .await;
@@ -316,7 +317,7 @@ pub async fn authenticate_via_wasm_plugin(
             correlation_id.as_deref(),
             plugin_name,
             "authenticate",
-            "suspicious",
+            Outcome::Failure,
             Some(OutcomeReason::literal("InvalidHandle")),
         )
         .await;
@@ -339,7 +340,7 @@ pub async fn authenticate_via_wasm_plugin(
         correlation_id.as_deref(),
         plugin_name,
         "authenticate",
-        "success",
+        Outcome::Success,
         None,
     )
     .await;
@@ -495,7 +496,7 @@ pub async fn authenticate_via_wasm_mapping_plugin(
             correlation_id.as_deref(),
             plugin_name,
             "mapping",
-            "rate_limited",
+            Outcome::Failure,
             Some(OutcomeReason::literal(bound.as_str())),
         )
         .await;
@@ -510,7 +511,7 @@ pub async fn authenticate_via_wasm_mapping_plugin(
             correlation_id.as_deref(),
             plugin_name,
             "mapping",
-            "rate_limited",
+            Outcome::Failure,
             Some(OutcomeReason::literal(bound.as_str())),
         )
         .await;
@@ -527,7 +528,7 @@ pub async fn authenticate_via_wasm_mapping_plugin(
                 correlation_id.as_deref(),
                 plugin_name,
                 "mapping",
-                "rate_limited",
+                Outcome::Failure,
                 Some(OutcomeReason::literal(bound.as_str())),
             )
             .await;
@@ -588,7 +589,7 @@ pub async fn authenticate_via_wasm_mapping_plugin(
                 correlation_id.as_deref(),
                 plugin_name,
                 "mapping",
-                "failure",
+                Outcome::Failure,
                 Some(OutcomeReason::literal("InvokeFailed")),
             )
             .await;
@@ -606,7 +607,7 @@ pub async fn authenticate_via_wasm_mapping_plugin(
                 correlation_id.as_deref(),
                 plugin_name,
                 "mapping",
-                "failure",
+                Outcome::Failure,
                 Some(OutcomeReason::literal("MalformedResponse")),
             )
             .await;
@@ -621,7 +622,7 @@ pub async fn authenticate_via_wasm_mapping_plugin(
                 correlation_id.as_deref(),
                 plugin_name,
                 "mapping",
-                "failure",
+                Outcome::Failure,
                 Some(OutcomeReason::literal("PluginDenied")),
             )
             .await;
@@ -663,7 +664,7 @@ pub async fn authenticate_via_wasm_mapping_plugin(
                 correlation_id.as_deref(),
                 plugin_name,
                 "mapping",
-                "success",
+                Outcome::Success,
                 None,
             )
             .await;
@@ -674,7 +675,7 @@ pub async fn authenticate_via_wasm_mapping_plugin(
                 correlation_id.as_deref(),
                 plugin_name,
                 "mapping",
-                "failure",
+                Outcome::Failure,
                 Some(OutcomeReason::variant(
                     &crate::events::AuditReason::audit_reason(e),
                 )),
@@ -771,6 +772,7 @@ pub async fn route_via_wasm_plugin(
             plugin_name,
             methods,
             "rate_limited",
+            Outcome::Failure,
             None,
             Some(OutcomeReason::literal(bound.as_str())),
         )
@@ -787,6 +789,7 @@ pub async fn route_via_wasm_plugin(
             plugin_name,
             methods,
             "rate_limited",
+            Outcome::Failure,
             None,
             Some(OutcomeReason::literal(bound.as_str())),
         )
@@ -805,6 +808,7 @@ pub async fn route_via_wasm_plugin(
                 plugin_name,
                 methods,
                 "rate_limited",
+                Outcome::Failure,
                 None,
                 Some(OutcomeReason::literal(bound.as_str())),
             )
@@ -867,6 +871,7 @@ pub async fn route_via_wasm_plugin(
                 plugin_name,
                 methods,
                 "failure",
+                Outcome::Failure,
                 None,
                 Some(OutcomeReason::literal("InvokeFailed")),
             )
@@ -886,6 +891,7 @@ pub async fn route_via_wasm_plugin(
                 plugin_name,
                 methods,
                 "failure",
+                Outcome::Failure,
                 None,
                 Some(OutcomeReason::literal("MalformedResponse")),
             )
@@ -902,6 +908,7 @@ pub async fn route_via_wasm_plugin(
                 plugin_name,
                 methods,
                 "passthrough",
+                Outcome::Success,
                 None,
                 None,
             )
@@ -922,6 +929,7 @@ pub async fn route_via_wasm_plugin(
                     plugin_name,
                     methods,
                     "failure",
+                    Outcome::Failure,
                     Some(&target_method),
                     Some(OutcomeReason::literal("TargetNotAllowed")),
                 )
@@ -936,6 +944,7 @@ pub async fn route_via_wasm_plugin(
                 plugin_name,
                 methods,
                 "route",
+                Outcome::Success,
                 Some(&target_method),
                 None,
             )
@@ -952,6 +961,7 @@ pub async fn route_via_wasm_plugin(
                 plugin_name,
                 methods,
                 "deny",
+                Outcome::Failure,
                 None,
                 Some(OutcomeReason::literal("PluginDenied")),
             )

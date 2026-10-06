@@ -17,7 +17,9 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
-use cadf::{AuditDispatcher, CadfEventPayload, Initiator, Observer, OutcomeReason, Target};
+use cadf::{
+    AuditDispatcher, CadfEventPayload, Initiator, Observer, Outcome, OutcomeReason, Target,
+};
 
 use crate::cadf_hook::with_request_address;
 
@@ -43,17 +45,14 @@ pub fn emit_oauth2_refresh_family_revoked_event(
         correlation_id.to_string(),
         chrono::Utc::now().to_rfc3339(),
         "oauth2/refresh_family_revoked".to_string(),
-        "success".to_string(),
+        Outcome::Success,
         Some(OutcomeReason::variant(reason)),
         with_request_address(initiator),
-        Target {
-            id: family_id.to_string(),
-            type_uri: "data/security/keystone/oauth2_refresh_family".to_string(),
-        },
-        Observer {
-            node_id: node_id.clone(),
-            id: format!("service/security/keystone/{node_id}"),
-        },
+        Target::new(family_id, "data/security/keystone/oauth2_refresh_family"),
+        Observer::new(
+            node_id.clone(),
+            format!("service/security/keystone/{node_id}"),
+        ),
     );
     let event = payload.sign(dispatcher);
     dispatcher.dispatch(event);

@@ -26,8 +26,8 @@
 //!
 //! - **Legacy**: exactly 32 raw bytes, written by earlier releases. It is
 //!   treated as a keyring with the single version `1`.
-//! - **Keyring**: JSON `{"current": <version>, "keys": {"<version>":
-//!   "<64 hex chars>", ..}}`.
+//! - **Keyring**: JSON `{"current": <version>, "keys": {"<version>": "<64 hex
+//!   chars>", ..}}`.
 //!
 //! New and rotated keyrings are always written in the JSON form, atomically
 //! (temporary file plus rename) with mode `0600`, so a concurrent reader never
@@ -35,7 +35,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -43,6 +43,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::ServiceIdentity;
+use crate::hex;
 use crate::kdf::derive_audit_hmac_key;
 use crate::spool::HmacKeyStore;
 
@@ -54,19 +55,33 @@ pub const INITIAL_KEY_VERSION: u64 = 1;
 /// Errors raised while loading, creating or rotating the keyring.
 #[derive(Debug, thiserror::Error)]
 pub enum KeyringError {
+    /// The key file exists but is neither a 32-byte legacy key nor a valid
+    /// keyring.
+    #[error(
+        "audit key file {path} is neither a 32-byte legacy key nor a valid keyring ({reason}); \
+          refusing to overwrite it"
+    )]
+    Invalid {
+        /// The offending key file.
+        path: PathBuf,
+        /// Why the file was rejected.
+        reason: String,
+    },
+    /// The key file could not be read or written.
     #[error("audit key file {path}: {source}")]
     Io {
+        /// The key file.
         path: PathBuf,
+        /// The I/O error.
         #[source]
         source: std::io::Error,
     },
-    #[error(
-        "audit key file {path} is neither a 32-byte legacy key nor a valid keyring ({reason}); \
-         refusing to overwrite it"
-    )]
-    Invalid { path: PathBuf, reason: String },
-    #[error("audit key file {0} does not exist; start Keystone once to create it")]
+    /// The key file does not exist yet.
+    #[error("audit key file {0} does not exist; start the service once to create it")]
     Missing(PathBuf),
+    /// Random key material could not be generated.
+    #[error("cannot generate random key material: {0}")]
+    Random(#[from] getrandom::Error),
 }
 
 fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> KeyringError + '_ {
@@ -78,17 +93,21 @@ fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> KeyringError + '_ {
 
 #[derive(Serialize, Deserialize)]
 struct KeyringFile {
+    /// The version that signs new events.
     current: u64,
+    /// Every KEK, hex-encoded, keyed by version.
     keys: BTreeMap<u64, String>,
 }
 
 /// All audit KEK versions and which one signs new events.
 #[derive(Clone)]
 pub struct HmacKeyring {
+    /// The version that signs new events.
     current: u64,
     /// Copy of `keks[current]`, kept so the signing key never needs a lookup
     /// that could fail.
     current_kek: [u8; KEK_LEN],
+    /// Every KEK, keyed by version.
     keks: BTreeMap<u64, [u8; KEK_LEN]>,
 }
 
@@ -103,12 +122,9 @@ impl fmt::Debug for HmacKeyring {
 }
 
 impl HmacKeyring {
-    fn single(kek: [u8; KEK_LEN]) -> Self {
-        Self {
-            current: INITIAL_KEY_VERSION,
-            current_kek: kek,
-            keks: BTreeMap::from([(INITIAL_KEY_VERSION, kek)]),
-        }
+    /// The per-node signing key for the current version.
+    pub fn current_node_key(&self, service: &ServiceIdentity, node_id: &str) -> [u8; 32] {
+        derive_audit_hmac_key(service, &self.current_kek, node_id)
     }
 
     /// The version that signs new events.
@@ -116,9 +132,44 @@ impl HmacKeyring {
         self.current
     }
 
-    /// All known key versions, ascending.
-    pub fn versions(&self) -> Vec<u64> {
-        self.keks.keys().copied().collect()
+    /// A [`HmacKeyStore`] resolving every version for `node_id`.
+    pub fn key_store(&self, service: &ServiceIdentity, node_id: &str) -> NodeKeyStore {
+        NodeKeyStore {
+            keyring: self.clone(),
+            node_id: node_id.to_string(),
+            service: *service,
+        }
+    }
+
+    /// Read the keyring at `path`; `None` if the file does not exist.
+    pub fn load(path: &Path) -> Result<Option<Self>, KeyringError> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(io_err(path)(e)),
+        };
+        Self::parse(path, &bytes).map(Some)
+    }
+
+    /// Read the keyring at `path`, creating it with a fresh random version-1
+    /// KEK if the file does not exist.
+    ///
+    /// Creation is race-safe: if another process creates the file first, its
+    /// key is used.
+    pub fn load_or_create(path: &Path) -> Result<Self, KeyringError> {
+        if let Some(existing) = Self::load(path)? {
+            return Ok(existing);
+        }
+        let keyring = Self::single(random_kek()?);
+        match keyring.write(path, true) {
+            Ok(()) => Ok(keyring),
+            Err(KeyringError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                Self::load(path)?.ok_or_else(|| KeyringError::Missing(path.to_path_buf()))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// The per-node signing key for `version`, if that version is known.
@@ -133,30 +184,6 @@ impl HmacKeyring {
             .map(|kek| derive_audit_hmac_key(service, kek, node_id))
     }
 
-    /// The per-node signing key for the current version.
-    pub fn current_node_key(&self, service: &ServiceIdentity, node_id: &str) -> [u8; 32] {
-        derive_audit_hmac_key(service, &self.current_kek, node_id)
-    }
-
-    /// A [`HmacKeyStore`] resolving every version for `node_id`.
-    pub fn key_store(&self, service: &ServiceIdentity, node_id: &str) -> NodeKeyStore {
-        NodeKeyStore {
-            keyring: self.clone(),
-            service: *service,
-            node_id: node_id.to_string(),
-        }
-    }
-
-    /// Read the keyring at `path`; `None` if the file does not exist.
-    pub fn load(path: &Path) -> Result<Option<Self>, KeyringError> {
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(io_err(path)(e)),
-        };
-        Self::parse(path, &bytes).map(Some)
-    }
-
     fn parse(path: &Path, bytes: &[u8]) -> Result<Self, KeyringError> {
         let invalid = |reason: String| KeyringError::Invalid {
             path: path.to_path_buf(),
@@ -169,8 +196,8 @@ impl HmacKeyring {
             .map_err(|e| invalid(format!("{} bytes, not JSON: {e}", bytes.len())))?;
         let mut keks = BTreeMap::new();
         for (version, hex_key) in file.keys {
-            let raw =
-                decode_hex(&hex_key).ok_or_else(|| invalid(format!("key {version} is not hex")))?;
+            let raw = hex::decode(&hex_key)
+                .ok_or_else(|| invalid(format!("key {version} is not hex")))?;
             let kek = <[u8; KEK_LEN]>::try_from(raw.as_slice())
                 .map_err(|_| invalid(format!("key {version} is not {KEK_LEN} bytes")))?;
             keks.insert(version, kek);
@@ -188,27 +215,6 @@ impl HmacKeyring {
         })
     }
 
-    /// Read the keyring at `path`, creating it with a fresh random version-1
-    /// KEK if the file does not exist.
-    ///
-    /// Creation is race-safe: if another process creates the file first, its
-    /// key is used.
-    pub fn load_or_create(path: &Path) -> Result<Self, KeyringError> {
-        if let Some(existing) = Self::load(path)? {
-            return Ok(existing);
-        }
-        let keyring = Self::single(random_kek(path)?);
-        match keyring.write(path, true) {
-            Ok(()) => Ok(keyring),
-            Err(KeyringError::Io { source, .. })
-                if source.kind() == std::io::ErrorKind::AlreadyExists =>
-            {
-                Self::load(path)?.ok_or_else(|| KeyringError::Missing(path.to_path_buf()))
-            }
-            Err(e) => Err(e),
-        }
-    }
-
     /// Add a new random KEK as the next version, make it current and persist
     /// the keyring. Returns the new current version.
     ///
@@ -218,12 +224,25 @@ impl HmacKeyring {
         let mut keyring =
             Self::load(path)?.ok_or_else(|| KeyringError::Missing(path.to_path_buf()))?;
         let next = keyring.keks.keys().next_back().copied().unwrap_or(0) + 1;
-        let kek = random_kek(path)?;
+        let kek = random_kek()?;
         keyring.keks.insert(next, kek);
         keyring.current = next;
         keyring.current_kek = kek;
         keyring.write(path, false)?;
         Ok(next)
+    }
+
+    fn single(kek: [u8; KEK_LEN]) -> Self {
+        Self {
+            current: INITIAL_KEY_VERSION,
+            current_kek: kek,
+            keks: BTreeMap::from([(INITIAL_KEY_VERSION, kek)]),
+        }
+    }
+
+    /// All known key versions, ascending.
+    pub fn versions(&self) -> Vec<u64> {
+        self.keks.keys().copied().collect()
     }
 
     /// Persist atomically with mode `0600`. With `create_new` the final path
@@ -234,7 +253,7 @@ impl HmacKeyring {
             keys: self
                 .keks
                 .iter()
-                .map(|(version, kek)| (*version, encode_hex(kek)))
+                .map(|(version, kek)| (*version, hex::encode(kek)))
                 .collect(),
         };
         let json = serde_json::to_vec(&file).map_err(|e| KeyringError::Invalid {
@@ -271,33 +290,20 @@ impl HmacKeyring {
     }
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-pub(crate) fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if !s.is_ascii() || !s.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-        .collect()
-}
-
-fn random_kek(path: &Path) -> Result<[u8; KEK_LEN], KeyringError> {
+fn random_kek() -> Result<[u8; KEK_LEN], KeyringError> {
     let mut raw = [0u8; KEK_LEN];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut raw))
-        .map_err(io_err(path))?;
+    getrandom::fill(&mut raw)?;
     Ok(raw)
 }
 
 /// Resolves any known key version to the per-node signing key.
 pub struct NodeKeyStore {
+    /// The keyring the versions resolve from.
     keyring: HmacKeyring,
-    service: ServiceIdentity,
+    /// The node the per-node keys are derived for.
     node_id: String,
+    /// The service identity the per-node keys are derived under.
+    service: ServiceIdentity,
 }
 
 impl HmacKeyStore for NodeKeyStore {

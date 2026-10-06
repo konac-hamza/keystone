@@ -27,7 +27,7 @@ use chrono::Utc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use cadf::{AuditDispatcher, CadfEventPayload, Initiator, Observer, Target};
+use cadf::{AuditDispatcher, CadfEventPayload, Initiator, Observer, Outcome, Target};
 
 use crate::keystone::ServiceState;
 use crate::oauth2_key::Oauth2KeyProviderError;
@@ -151,17 +151,14 @@ fn emit_maintenance_event(dispatcher: &Arc<AuditDispatcher>, action: &str, domai
         correlation_id,
         Utc::now().to_rfc3339(),
         action.to_string(),
-        "success".to_string(),
+        Outcome::Success,
         None,
         initiator,
-        Target {
-            id: domain_id.to_string(),
-            type_uri: "data/security/keystone/oauth2_signing_key".to_string(),
-        },
-        Observer {
-            node_id: node_id.clone(),
-            id: format!("service/security/keystone/{node_id}"),
-        },
+        Target::new(domain_id, "data/security/keystone/oauth2_signing_key"),
+        Observer::new(
+            node_id.clone(),
+            format!("service/security/keystone/{node_id}"),
+        ),
     );
     let event = payload.sign(dispatcher);
     dispatcher.dispatch(event);

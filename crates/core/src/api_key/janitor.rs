@@ -29,7 +29,7 @@ use chrono::Utc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use cadf::{AuditDispatcher, CadfEventPayload, Initiator, Observer, Target};
+use cadf::{AuditDispatcher, CadfEventPayload, Initiator, Observer, Outcome, Target};
 use openstack_keystone_core_types::api_key::{ApiClientResource, ApiClientResourceUpdate};
 
 use crate::api_key::ApiKeyProviderError;
@@ -176,17 +176,14 @@ fn emit_maintenance_event(dispatcher: &Arc<AuditDispatcher>, action: &str, clien
         correlation_id,
         Utc::now().to_rfc3339(),
         action.to_string(),
-        "success".to_string(),
+        Outcome::Success,
         None,
         initiator,
-        Target {
-            id: client_id.to_string(),
-            type_uri: "data/security/keystone/api_key".to_string(),
-        },
-        Observer {
-            node_id: node_id.clone(),
-            id: format!("service/security/keystone/{node_id}"),
-        },
+        Target::new(client_id, "data/security/keystone/api_key"),
+        Observer::new(
+            node_id.clone(),
+            format!("service/security/keystone/{node_id}"),
+        ),
     );
     let event = payload.sign(dispatcher);
     dispatcher.dispatch(event);
