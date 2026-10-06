@@ -30,7 +30,7 @@ use openstack_sdk::config::CloudConfig;
 use test_api::assignment::grant::add_project_grant;
 use test_api::auth::token::auth_token;
 use test_api::common;
-use test_api::guard::ResourceGuard;
+use test_api::guard::{AsyncResourceGuard, ResourceGuard};
 use test_api::identity::user::create_user;
 use test_api::resource::project::create_project;
 use test_api::role::list_roles;
@@ -77,7 +77,7 @@ async fn create_app_cred_for_user(
     app_cred_secret: &str,
     roles: &[serde_json::Value],
 ) -> Result<(String, String)> {
-    let mut tc = common::TestClient::default()?;
+    let mut tc = common::TestClient::new()?;
     tc.auth_password(
         common::get_password_auth(user_name, password, user_domain_id)?,
         Some(Scope::Project(
@@ -227,7 +227,7 @@ async fn test_auth_by_application_credential_name() -> Result<()> {
     let member = roles.get("member").expect("member role must exist");
     add_project_grant(&admin, &project.id, &user.id, member).await?;
 
-    let mut tc = common::TestClient::default()?;
+    let mut tc = common::TestClient::new()?;
     tc.auth_password(
         common::get_password_auth(&user.name, password, &user.domain_id)?,
         Some(Scope::Project(
@@ -635,5 +635,161 @@ async fn test_auth_by_application_credential_raw_401() -> Result<()> {
         "must return 401 for invalid application credential"
     );
 
+    Ok(())
+}
+
+/// Create a user with a member role grant on a fresh project, plus an
+/// application credential of that user. Returns the guards of the created
+/// resources, the credential ID and name.
+async fn setup_user_with_app_cred(
+    secret: &str,
+) -> Result<(
+    AsyncResourceGuard<openstack_keystone_api_types::v3::user::User>,
+    AsyncResourceGuard<openstack_keystone_api_types::v3::project::Project>,
+    String,
+    String,
+)> {
+    let admin = Arc::new(AsyncOpenStack::new(&CloudConfig::from_env()?).await?);
+    let password = "TestPassword123!";
+    let user = create_user(
+        &admin,
+        UserCreateBuilder::default()
+            .name(format!("usr_{}", Uuid::new_v4().simple()))
+            .domain_id("default")
+            .enabled(true)
+            .password(password)
+            .build()?,
+    )
+    .await?;
+    let project = create_project(
+        &admin,
+        ProjectCreateBuilder::default()
+            .domain_id("default")
+            .parent_id("default")
+            .name(format!("prj_{}", Uuid::new_v4().simple()))
+            .is_domain(false)
+            .enabled(true)
+            .build()?,
+    )
+    .await?;
+    let roles: HashMap<String, String> = list_roles(&admin)
+        .await?
+        .into_iter()
+        .map(|r| (r.name, r.id))
+        .collect();
+    let member = roles.get("member").expect("member role must exist");
+    add_project_grant(&admin, &project.id, &user.id, member).await?;
+    let (cred_id, cred_name) = create_app_cred_for_user(
+        &user.id,
+        &user.name,
+        password,
+        &user.domain_id,
+        &project.id,
+        "default",
+        secret,
+        &[serde_json::json!({"id": member, "name": "member"})],
+    )
+    .await?;
+    Ok((user, project, cred_id, cred_name))
+}
+
+#[tokio::test]
+async fn test_auth_by_application_credential_explicit_scope_forbidden() -> Result<()> {
+    let secret = "scope_forbidden_secret";
+    let (user, project, cred_id, _) = setup_user_with_app_cred(secret).await?;
+
+    // Requesting a scope is prohibited, even the credential's own project.
+    let body = serde_json::json!({
+        "auth": {
+            "identity": {
+                "methods": ["application_credential"],
+                "application_credential": {"id": &cred_id, "secret": secret}
+            },
+            "scope": {"project": {"id": &project.id}}
+        }
+    });
+    let rsp = common::raw_request(http::Method::POST, "v3/auth/tokens", None, Some(body)).await?;
+    assert_eq!(rsp.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // A token obtained with the credential cannot be exchanged with a scope.
+    let body = serde_json::json!({
+        "auth": {
+            "identity": {
+                "methods": ["application_credential"],
+                "application_credential": {"id": &cred_id, "secret": secret}
+            }
+        }
+    });
+    let rsp = common::raw_request(http::Method::POST, "v3/auth/tokens", None, Some(body)).await?;
+    assert_eq!(rsp.status(), reqwest::StatusCode::CREATED);
+    let token = rsp
+        .headers()
+        .get("X-Subject-Token")
+        .expect("token header")
+        .to_str()?
+        .to_string();
+    let body = serde_json::json!({
+        "auth": {
+            "identity": {"methods": ["token"], "token": {"id": &token}},
+            "scope": {"project": {"id": &project.id}}
+        }
+    });
+    let rsp = common::raw_request(http::Method::POST, "v3/auth/tokens", None, Some(body)).await?;
+    assert_eq!(rsp.status(), reqwest::StatusCode::FORBIDDEN);
+
+    user.delete().await?;
+    project.delete().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_auth_by_application_credential_foreign_user_rejected() -> Result<()> {
+    let secret = "foreign_user_secret";
+    let (user, project, cred_id, _) = setup_user_with_app_cred(secret).await?;
+
+    let body = serde_json::json!({
+        "auth": {
+            "identity": {
+                "methods": ["application_credential"],
+                "application_credential": {
+                    "id": &cred_id,
+                    "secret": secret,
+                    "user": {"id": "some_other_user_id"}
+                }
+            }
+        }
+    });
+    let rsp = common::raw_request(http::Method::POST, "v3/auth/tokens", None, Some(body)).await?;
+    assert_eq!(rsp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    user.delete().await?;
+    project.delete().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_auth_by_application_credential_name_with_user_name_and_domain() -> Result<()> {
+    let secret = "by_user_name_secret";
+    let (user, project, _, cred_name) = setup_user_with_app_cred(secret).await?;
+
+    let body = serde_json::json!({
+        "auth": {
+            "identity": {
+                "methods": ["application_credential"],
+                "application_credential": {
+                    "name": &cred_name,
+                    "secret": secret,
+                    "user": {"name": &user.name, "domain": {"id": "default"}}
+                }
+            }
+        }
+    });
+    let rsp = common::raw_request(http::Method::POST, "v3/auth/tokens", None, Some(body)).await?;
+    assert_eq!(rsp.status(), reqwest::StatusCode::CREATED);
+    let token_resp: serde_json::Value = rsp.json().await?;
+    assert_eq!(token_resp["token"]["user"]["id"].as_str().unwrap(), user.id);
+
+    user.delete().await?;
+    project.delete().await?;
     Ok(())
 }

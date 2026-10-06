@@ -66,21 +66,139 @@ impl ApplicationCredentialService {
     }
 }
 
+impl ApplicationCredentialService {
+    /// Resolve the user reference into the user ID.
+    ///
+    /// Returns `None` when the referenced user (or its domain) does not
+    /// exist.
+    async fn resolve_user_ref<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        user: &UserAuthRef,
+    ) -> Result<Option<String>, ApplicationCredentialProviderError> {
+        let state = ctx.state();
+        if let Some(id) = &user.id {
+            // When both ID and name are given, the name must match as well.
+            let Some(found) = state
+                .provider
+                .get_identity_provider()
+                .get_user(ctx, id)
+                .await
+                .map_err(|e| ApplicationCredentialProviderError::Driver(e.to_string()))?
+            else {
+                return Ok(None);
+            };
+            if user.name.as_ref().is_some_and(|name| *name != found.name) {
+                return Ok(None);
+            }
+            if let Some(domain) = &user.domain
+                && domain
+                    .id
+                    .as_ref()
+                    .is_some_and(|did| *did != found.domain_id)
+            {
+                return Ok(None);
+            }
+            if let Some(domain_name) = user.domain.as_ref().and_then(|d| d.name.as_ref()) {
+                // The domain name must match the domain of the user as well.
+                let user_domain = state
+                    .provider
+                    .get_resource_provider()
+                    .get_domain(ctx, &found.domain_id)
+                    .await
+                    .map_err(|e| ApplicationCredentialProviderError::Driver(e.to_string()))?;
+                if user_domain.is_none_or(|d| d.name != *domain_name) {
+                    return Ok(None);
+                }
+            }
+            return Ok(Some(found.id));
+        }
+        let (Some(name), Some(domain)) = (&user.name, &user.domain) else {
+            return Ok(None);
+        };
+        let domain_id = if let Some(did) = &domain.id {
+            did.clone()
+        } else if let Some(dname) = &domain.name {
+            match state
+                .provider
+                .get_resource_provider()
+                .find_domain_by_name(ctx, dname)
+                .await
+                .map_err(|e| ApplicationCredentialProviderError::Driver(e.to_string()))?
+            {
+                Some(d) => d.id,
+                None => return Ok(None),
+            }
+        } else {
+            return Ok(None);
+        };
+        state
+            .provider
+            .get_identity_provider()
+            .find_user_by_name_ci(ctx, &domain_id, name)
+            .await
+            .map_err(|e| ApplicationCredentialProviderError::Driver(e.to_string()))
+    }
+
+    /// Find the credential addressed by the authentication request.
+    ///
+    /// Returns `None` when no credential matches, including when the
+    /// supplied user reference does not point to the credential owner.
+    async fn resolve_credential<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        data: &ApplicationCredentialAuthData,
+    ) -> Result<Option<ApplicationCredential>, ApplicationCredentialProviderError> {
+        match data {
+            ApplicationCredentialAuthData::Id(by_id) => {
+                let Some(app_cred) = self.get_application_credential(ctx, &by_id.id).await? else {
+                    return Ok(None);
+                };
+                if let Some(user) = &by_id.user
+                    && self.resolve_user_ref(ctx, user).await?.as_deref()
+                        != Some(app_cred.user_id.as_str())
+                {
+                    return Ok(None);
+                }
+                Ok(Some(app_cred))
+            }
+            ApplicationCredentialAuthData::Name(by_name) => {
+                let Some(user_id) = self.resolve_user_ref(ctx, &by_name.user).await? else {
+                    return Ok(None);
+                };
+                let params = ApplicationCredentialListParameters {
+                    name: Some(by_name.name.clone()),
+                    user_id,
+                    ..Default::default()
+                };
+                Ok(self
+                    .list_application_credentials(ctx, &params)
+                    .await?
+                    .into_iter()
+                    .next())
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl ApplicationCredentialApi for ApplicationCredentialService {
     /// Authenticate using an application credential.
     ///
-    /// Resolves the credential (by ID, or by name + owning user ID),
-    /// verifies the secret against the stored hash, checks that the
-    /// credential has not expired, and validates that the owning user,
-    /// bound project, and project domain are all enabled.
+    /// Resolves the credential (by ID, or by name + owning user), verifies
+    /// that an optionally supplied user reference matches the credential
+    /// owner, applies the per-user rate limit, verifies the secret against
+    /// the stored hash and checks that the credential has not expired.
+    ///
+    /// This only authenticates the credential. Whether the owning user,
+    /// bound project and project domain are enabled, and whether the
+    /// credential may be used for a given scope, is validated centrally
+    /// by [`SecurityContext`](crate::auth::SecurityContext) and
+    /// `ValidatedSecurityContext`.
     ///
     /// # Parameters
     /// - `ctx`: The execution context.
-    /// - `id`: The application credential ID (optional if `name` is given).
-    /// - `name`: The application credential name (optional if `id` is given).
-    /// - `user_id`: The owning user ID (required when resolving by `name`).
-    /// - `secret`: The application credential secret.
+    /// - `auth`: The application credential authentication request.
     ///
     /// # Returns
     /// - `Result<AuthenticationResult, ApplicationCredentialProviderError>` -
@@ -95,37 +213,28 @@ impl ApplicationCredentialApi for ApplicationCredentialService {
         let state = ctx.state();
 
         // --- 1. Resolve the credential ---
-        let app_cred = match &auth.credential {
-            ApplicationCredentialAuthData::Id(by_id) => self
-                .get_application_credential(ctx, &by_id.id)
-                .await?
-                .ok_or(ApplicationCredentialProviderError::AuthenticationFailed)?,
-            ApplicationCredentialAuthData::Name(by_name) => {
-                let uid = by_name
-                    .user
-                    .id
-                    .as_deref()
-                    .ok_or(ApplicationCredentialProviderError::AuthenticationFailed)?;
-                let params = ApplicationCredentialListParameters {
-                    name: Some(by_name.name.clone()),
-                    user_id: uid.to_string(),
-                    ..Default::default()
-                };
-                self.list_application_credentials(ctx, &params)
-                    .await?
-                    .into_iter()
-                    .next()
-                    .ok_or(ApplicationCredentialProviderError::AuthenticationFailed)?
+        let app_cred = match self.resolve_credential(ctx, &auth.credential).await? {
+            Some(app_cred) => app_cred,
+            None => {
+                // Unknown credentials never touch the rate limiter store
+                // (ADR-0022 Invariant 8). Burn a dummy hash verification
+                // instead so the not-found path is indistinguishable from a
+                // wrong secret by timing.
+                let _ = self
+                    .backend_driver
+                    .verify_application_credential_secret(state, "", &auth.secret)
+                    .await;
+                return Err(ApplicationCredentialProviderError::AuthenticationFailed);
             }
         };
 
         // --- 2. Rate limit (ADR-0022) ---
-        if state.rate_limiters.user_auth_enabled() {
-            if let Err(retry_after) = state.rate_limiters.check_user(&app_cred.user_id) {
-                return Err(ApplicationCredentialProviderError::TooManyRequests {
-                    retry_after_secs: retry_after.as_secs(),
-                });
-            }
+        if state.rate_limiters.user_auth_enabled()
+            && let Err(retry_after) = state.rate_limiters.check_user(&app_cred.user_id)
+        {
+            return Err(ApplicationCredentialProviderError::TooManyRequests {
+                retry_after_secs: retry_after.as_secs(),
+            });
         }
 
         // --- 3. Verify the secret ---
@@ -134,10 +243,10 @@ impl ApplicationCredentialApi for ApplicationCredentialService {
             .await?;
 
         // --- 4. Check credential expiration ---
-        if let Some(expires_at) = app_cred.expires_at {
-            if expires_at < Utc::now() {
-                return Err(ApplicationCredentialProviderError::ApplicationCredentialExpired);
-            }
+        if let Some(expires_at) = app_cred.expires_at
+            && expires_at < Utc::now()
+        {
+            return Err(ApplicationCredentialProviderError::ApplicationCredentialExpired);
         }
 
         // --- 5. Fetch user for identity info ---
@@ -761,5 +870,239 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
+    }
+
+    fn stored_cred() -> ApplicationCredential {
+        ApplicationCredentialBuilder::default()
+            .id("cid")
+            .name("cname")
+            .project_id("pid")
+            .user_id("uid")
+            .unrestricted(false)
+            .roles(vec![])
+            .build()
+            .unwrap()
+    }
+
+    fn user(id: &str) -> openstack_keystone_core_types::identity::UserResponse {
+        openstack_keystone_core_types::identity::UserResponseBuilder::default()
+            .id(id)
+            .name("uname")
+            .domain_id("udid")
+            .enabled(true)
+            .build()
+            .unwrap()
+    }
+
+    fn by_id(user: Option<UserAuthRef>) -> ApplicationCredentialAuthRequest {
+        ApplicationCredentialAuthRequest {
+            secret: "s3cr3t".into(),
+            credential: ApplicationCredentialAuthData::Id(ApplicationCredentialAuthById {
+                id: "cid".into(),
+                user,
+            }),
+        }
+    }
+
+    /// Backend returning the credential `cid`. The secret verification
+    /// expects exactly `verify_calls` calls.
+    fn backend(verify_calls: usize) -> MockApplicationCredentialBackend {
+        let mut backend = MockApplicationCredentialBackend::new();
+        backend
+            .expect_get_application_credential()
+            .returning(|_, id| Ok((id == "cid").then(stored_cred)));
+        backend
+            .expect_list_application_credentials()
+            .returning(|_, _| Ok(vec![stored_cred()]));
+        backend
+            .expect_verify_application_credential_secret()
+            .times(verify_calls)
+            .returning(|_, id, _| {
+                if id == "cid" {
+                    Ok(())
+                } else {
+                    Err(ApplicationCredentialProviderError::AuthenticationFailed)
+                }
+            });
+        backend
+    }
+
+    /// A credential that does not exist burns the dummy hash verification
+    /// (called with an ID that cannot match) and never touches the rate
+    /// limiter store (ADR-0022 Invariant 8).
+    #[tokio::test]
+    async fn test_authenticate_not_found_burns_dummy_hash() {
+        let mut backend = MockApplicationCredentialBackend::new();
+        backend
+            .expect_get_application_credential()
+            .returning(|_, _| Ok(None));
+        backend
+            .expect_verify_application_credential_secret()
+            .withf(|_, id: &str, _| id.is_empty())
+            .times(3)
+            .returning(|_, _, _| Err(ApplicationCredentialProviderError::AuthenticationFailed));
+        let state = get_mocked_state(
+            Some(Config {
+                rate_limit_user_auth: openstack_keystone_config::RateLimitSection {
+                    enabled: true,
+                    burst_size: 1,
+                    replenish_rate_per_second: 1,
+                },
+                ..Default::default()
+            }),
+            Some(Provider::mocked_builder().mock_role(no_op_role_mock())),
+        )
+        .await;
+        let svc = make_service(backend);
+        // Repeated attempts are never rate limited for unknown credentials.
+        for _ in 0..3 {
+            backend_call_not_found(&svc, &state).await;
+        }
+    }
+
+    async fn backend_call_not_found(
+        svc: &ApplicationCredentialService,
+        state: &crate::keystone::ServiceState,
+    ) {
+        assert!(matches!(
+            svc.authenticate_by_application_credential(
+                &ExecutionContext::internal(state),
+                &by_id(None)
+            )
+            .await,
+            Err(ApplicationCredentialProviderError::AuthenticationFailed)
+        ));
+    }
+
+    /// The user reference naming another user than the owner is rejected and
+    /// indistinguishable from an unknown credential (dummy hash burned).
+    #[tokio::test]
+    async fn test_authenticate_foreign_user_ref_rejected() {
+        let mut identity_mock = crate::identity::MockIdentityProvider::default();
+        identity_mock
+            .expect_get_user()
+            .returning(|_, id| Ok(Some(user(id))));
+        let backend = {
+            let mut b = MockApplicationCredentialBackend::new();
+            b.expect_get_application_credential()
+                .returning(|_, _| Ok(Some(stored_cred())));
+            b.expect_verify_application_credential_secret()
+                .withf(|_, id: &str, _| id.is_empty())
+                .times(1)
+                .returning(|_, _, _| Err(ApplicationCredentialProviderError::AuthenticationFailed));
+            b
+        };
+        let state = get_mocked_state(
+            None,
+            Some(
+                Provider::mocked_builder()
+                    .mock_role(no_op_role_mock())
+                    .mock_identity(identity_mock),
+            ),
+        )
+        .await;
+        let result = make_service(backend)
+            .authenticate_by_application_credential(
+                &ExecutionContext::internal(&state),
+                &by_id(Some(UserAuthRef {
+                    id: Some("other".into()),
+                    name: None,
+                    domain: None,
+                })),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(ApplicationCredentialProviderError::AuthenticationFailed)
+        ));
+    }
+
+    /// A user ID together with a mismatching domain name is rejected.
+    #[tokio::test]
+    async fn test_authenticate_user_ref_domain_name_mismatch_rejected() {
+        let mut identity_mock = crate::identity::MockIdentityProvider::default();
+        identity_mock
+            .expect_get_user()
+            .returning(|_, id| Ok(Some(user(id))));
+        let mut resource_mock = crate::resource::MockResourceProvider::default();
+        resource_mock.expect_get_domain().returning(|_, _| {
+            Ok(Some(
+                openstack_keystone_core_types::resource::DomainBuilder::default()
+                    .id("udid")
+                    .name("real")
+                    .enabled(true)
+                    .build()
+                    .unwrap(),
+            ))
+        });
+        let state = get_mocked_state(
+            None,
+            Some(
+                Provider::mocked_builder()
+                    .mock_role(no_op_role_mock())
+                    .mock_identity(identity_mock)
+                    .mock_resource(resource_mock),
+            ),
+        )
+        .await;
+        let result = make_service(backend_burning())
+            .authenticate_by_application_credential(
+                &ExecutionContext::internal(&state),
+                &by_id(Some(UserAuthRef {
+                    id: Some("uid".into()),
+                    name: None,
+                    domain: Some(openstack_keystone_core_types::scope::Domain {
+                        id: None,
+                        name: Some("fake".into()),
+                    }),
+                })),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(ApplicationCredentialProviderError::AuthenticationFailed)
+        ));
+    }
+
+    fn backend_burning() -> MockApplicationCredentialBackend {
+        let mut b = MockApplicationCredentialBackend::new();
+        b.expect_get_application_credential()
+            .returning(|_, _| Ok(Some(stored_cred())));
+        b.expect_verify_application_credential_secret()
+            .withf(|_, id: &str, _| id.is_empty())
+            .times(1)
+            .returning(|_, _, _| Err(ApplicationCredentialProviderError::AuthenticationFailed));
+        b
+    }
+
+    /// The per-user limiter is keyed on the credential owner and fires before
+    /// the secret is verified.
+    #[tokio::test]
+    async fn test_authenticate_rate_limited() {
+        let state = get_mocked_state(
+            Some(Config {
+                rate_limit_user_auth: openstack_keystone_config::RateLimitSection {
+                    enabled: true,
+                    burst_size: 1,
+                    replenish_rate_per_second: 1,
+                },
+                ..Default::default()
+            }),
+            Some(Provider::mocked_builder().mock_role(no_op_role_mock())),
+        )
+        .await;
+        // Exhaust the bucket of the credential owner.
+        assert!(state.rate_limiters.check_user("uid").is_ok());
+        let result = make_service(backend(0))
+            .authenticate_by_application_credential(
+                &ExecutionContext::internal(&state),
+                &by_id(None),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(ApplicationCredentialProviderError::TooManyRequests { retry_after_secs })
+                if retry_after_secs >= 1
+        ));
     }
 }

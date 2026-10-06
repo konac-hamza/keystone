@@ -323,6 +323,11 @@ impl From<ApplicationCredentialProviderError> for KeystoneApiError {
     fn from(value: ApplicationCredentialProviderError) -> Self {
         match value {
             ApplicationCredentialProviderError::AuthenticationFailed => Self::UnauthorizedNoContext,
+            ApplicationCredentialProviderError::TooManyRequests { retry_after_secs } => {
+                Self::TooManyRequests {
+                    retry_after: retry_after_secs,
+                }
+            }
             ApplicationCredentialProviderError::ApplicationCredentialNotFound(x) => {
                 Self::NotFound {
                     resource: "application_credential".into(),
@@ -1090,6 +1095,31 @@ mod tests {
             api_err,
             KeystoneApiError::InternalError(msg) if msg.contains("test error")
         ));
+    }
+
+    /// The application credential per-user rate limit converts into the
+    /// unified 429 with `Retry-After` and not into a 500.
+    #[test]
+    fn application_credential_too_many_requests_maps_to_unified_429() {
+        let err = ApplicationCredentialProviderError::TooManyRequests {
+            retry_after_secs: 9,
+        };
+        let api_err: KeystoneApiError = err.into();
+        assert!(matches!(
+            api_err,
+            KeystoneApiError::TooManyRequests { retry_after: 9 }
+        ));
+        let response = <KeystoneApiError as IntoResponse>::into_response(api_err);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .expect("Retry-After header must be present")
+                .to_str()
+                .unwrap(),
+            "9"
+        );
     }
 
     /// ADR-0022 Invariant 3: the per-user limiter's driver-level rejection

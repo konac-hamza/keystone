@@ -130,6 +130,16 @@ async fn create_inner(
     .await?;
     let ctx = SecurityContext::try_from(auth_res)?;
     *known_initiator = Some(build_initiator_from_principal(ctx.principal()));
+    // Application credentials are bound to a single project, which is derived
+    // from the credential. Same as in python keystone, requesting a scope is
+    // prohibited, also when exchanging an application credential token.
+    if matches!(
+        ctx.authentication_context(),
+        AuthenticationContext::ApplicationCredential { .. }
+    ) && req.auth.scope.is_some()
+    {
+        return Err(AuthenticationError::ScopeNotAllowed.into());
+    }
     let provider_scope: Option<ProviderScope> = req.auth.scope.clone().map(Into::into);
     let authz_info = get_authz_info(state, provider_scope.as_ref()).await?;
 
@@ -1506,6 +1516,84 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let res: TokenResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(vec!["application_credential"], res.token.methods);
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_post_application_credential_explicit_scope_forbidden() {
+        let auth = AuthenticationResultBuilder::default()
+            .context(AuthenticationContext::ApplicationCredential {
+                application_credential: openstack_keystone_core_types::application_credential::ApplicationCredentialBuilder::default()
+                    .id("app_cred_id")
+                    .name("my_app_cred")
+                    .project_id("pid")
+                    .user_id("uid")
+                    .unrestricted(false)
+                    .roles(vec![])
+                    .build()
+                    .unwrap(),
+                token: None,
+            })
+            .principal(PrincipalInfo {
+                identity: IdentityInfo::User(
+                    UserIdentityInfoBuilder::default()
+                        .user_id("uid")
+                        .build()
+                        .unwrap(),
+                ),
+            })
+            .build()
+            .unwrap();
+        let mut app_cred_mock = MockApplicationCredentialProvider::default();
+        app_cred_mock
+            .expect_authenticate_by_application_credential()
+            .returning(move |_, _| Ok(auth.clone()));
+        // No other provider is mocked: the request must be rejected before
+        // scope resolution and token issuance.
+        let provider = Provider::mocked_builder()
+            .mock_application_credential(app_cred_mock)
+            .build()
+            .unwrap();
+        let state = Arc::new(
+            Service::new(
+                ConfigManager::not_watched(Config::default()),
+                DatabaseConnection::default(),
+                provider,
+                Arc::new(MockPolicy::default()),
+                AuditDispatcher::noop(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state.clone());
+
+        // Even the credential's own project must not be requested.
+        let body = serde_json::to_vec(&json!({
+            "auth": {
+                "identity": {
+                    "methods": ["application_credential"],
+                    "application_credential": {"id": "app_cred_id", "secret": "app_cred_secret"}
+                },
+                "scope": {"project": {"id": "pid"}}
+            }
+        }))
+        .unwrap();
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

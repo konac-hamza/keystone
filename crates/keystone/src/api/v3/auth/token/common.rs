@@ -64,9 +64,14 @@ pub(super) async fn authenticate_request(
     // Mirror the typed application_credential field into effective_extra
     // so route-mode plugins can inspect it (ADR 0025 §4).
     if let Some(app_cred) = &req.auth.identity.application_credential {
+        let payload = serde_json::to_value(app_cred).map_err(|e| {
+            KeystoneApiError::InternalError(format!(
+                "cannot serialize the application_credential payload: {e}"
+            ))
+        })?;
         effective_extra
             .entry("application_credential".to_string())
-            .or_insert_with(|| serde_json::to_value(app_cred).unwrap_or_default());
+            .or_insert(payload);
     }
     {
         let router = {

@@ -22,7 +22,6 @@ use openstack_keystone::auth::*;
 use openstack_keystone::token::{FernetToken, TokenProviderError};
 use openstack_keystone_core::auth::ExecutionContext;
 use openstack_keystone_core_types::application_credential::*;
-use openstack_keystone_core_types::resource::{DomainBuilder, ProjectBuilder};
 use openstack_keystone_core_types::role::*;
 
 use super::{grant_role_to_user_on_project, revoke_role_from_user_on_project};
@@ -82,19 +81,7 @@ async fn test_valid() -> Result<(), Report> {
         .issue_token_context(
             &ExecutionContext::internal(&state),
             &ctx,
-            &ScopeInfo::Project {
-                project: ProjectBuilder::default()
-                    .id(cred.project_id.clone())
-                    .name(project.id.clone())
-                    .domain_id(domain.id.clone())
-                    .enabled(true)
-                    .build()?,
-                project_domain: DomainBuilder::default()
-                    .id(domain.id.clone())
-                    .name(domain.name.clone())
-                    .enabled(true)
-                    .build()?,
-            },
+            &ScopeInfo::Unscoped,
         )
         .await?;
 
@@ -190,19 +177,7 @@ async fn test_expired() -> Result<(), Report> {
         .issue_token_context(
             &ExecutionContext::internal(&state),
             &ctx,
-            &ScopeInfo::Project {
-                project: ProjectBuilder::default()
-                    .id(cred.project_id.clone())
-                    .name(project.id.clone())
-                    .domain_id(domain.id.clone())
-                    .enabled(true)
-                    .build()?,
-                project_domain: DomainBuilder::default()
-                    .id(domain.id.clone())
-                    .name(domain.name.clone())
-                    .enabled(true)
-                    .build()?,
-            },
+            &ScopeInfo::Unscoped,
         )
         .await;
 
@@ -271,19 +246,7 @@ async fn test_valid_fewer_roles() -> Result<(), Report> {
         .issue_token_context(
             &ExecutionContext::internal(&state),
             &ctx,
-            &ScopeInfo::Project {
-                project: ProjectBuilder::default()
-                    .id(cred.project_id.clone())
-                    .name(project.id.clone())
-                    .domain_id(domain.id.clone())
-                    .enabled(true)
-                    .build()?,
-                project_domain: DomainBuilder::default()
-                    .id(domain.id.clone())
-                    .name(domain.name.clone())
-                    .enabled(true)
-                    .build()?,
-            },
+            &ScopeInfo::Unscoped,
         )
         .await?;
 
@@ -383,19 +346,7 @@ async fn test_valid_all_roles_revoked() -> Result<(), Report> {
         .issue_token_context(
             &ExecutionContext::internal(&state),
             &ctx,
-            &ScopeInfo::Project {
-                project: ProjectBuilder::default()
-                    .id(cred.project_id.clone())
-                    .name(project.id.clone())
-                    .domain_id(domain.id.clone())
-                    .enabled(true)
-                    .build()?,
-                project_domain: DomainBuilder::default()
-                    .id(domain.id.clone())
-                    .name(domain.name.clone())
-                    .enabled(true)
-                    .build()?,
-            },
+            &ScopeInfo::Unscoped,
         )
         .await?;
 
@@ -477,19 +428,7 @@ async fn test_token_revoked() -> Result<(), Report> {
         .issue_token_context(
             &ExecutionContext::internal(&state),
             &ctx,
-            &ScopeInfo::Project {
-                project: ProjectBuilder::default()
-                    .id(cred.project_id.clone())
-                    .name(project.id.clone())
-                    .domain_id(domain.id.clone())
-                    .enabled(true)
-                    .build()?,
-                project_domain: DomainBuilder::default()
-                    .id(domain.id.clone())
-                    .name(domain.name.clone())
-                    .enabled(true)
-                    .build()?,
-            },
+            &ScopeInfo::Unscoped,
         )
         .await?;
 

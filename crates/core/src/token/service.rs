@@ -506,17 +506,18 @@ impl TokenApi for TokenService {
     ) -> Result<ValidatedSecurityContext, TokenProviderError> {
         let mut sc = ctx.clone();
 
-        // Application credential auth: auto-derive the project scope from
-        // the credential's bound project when no explicit scope is provided.
-        // The credential is always bound to exactly one project.
-        let effective_scope = if let (
-            AuthenticationContext::ApplicationCredential {
-                application_credential,
-                ..
-            },
-            ScopeInfo::Unscoped,
-        ) = (ctx.authentication_context(), scope)
+        // Application credential auth: the credential is always bound to
+        // exactly one project, which is derived from the credential. Same as
+        // in python keystone, requesting any explicit scope is prohibited,
+        // also when exchanging an application credential token.
+        let effective_scope = if let AuthenticationContext::ApplicationCredential {
+            application_credential,
+            ..
+        } = ctx.authentication_context()
         {
+            if !matches!(scope, ScopeInfo::Unscoped) {
+                return Err(AuthenticationError::ScopeNotAllowed.into());
+            }
             let exec_ctx = ExecutionContext::internal(state);
             let project = state
                 .provider

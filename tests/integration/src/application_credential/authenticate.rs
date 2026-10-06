@@ -20,6 +20,7 @@ use tracing_test::traced_test;
 use uuid::Uuid;
 
 use openstack_keystone::application_credential::ApplicationCredentialProviderError;
+use openstack_keystone::token::TokenProviderError;
 use openstack_keystone_core::auth::ExecutionContext;
 use openstack_keystone_core_types::application_credential::*;
 use openstack_keystone_core_types::auth::*;
@@ -538,6 +539,272 @@ async fn test_authenticate_by_app_cred_scope_to_different_project_rejected() -> 
         ctx.validate_scope_boundaries(&system_scope).is_err(),
         "app cred must not be scoped to system"
     );
+
+    Ok(())
+}
+
+/// Create an application credential for the user in the project.
+async fn create_cred(
+    state: &std::sync::Arc<openstack_keystone::keystone::Service>,
+    project_id: &str,
+    user_id: &str,
+    name: &str,
+    secret: &str,
+    roles: &[RoleRef],
+) -> Result<ApplicationCredentialCreateResponse, Report> {
+    Ok(state
+        .provider
+        .get_application_credential_provider()
+        .create_application_credential(
+            &ExecutionContext::internal(state),
+            ApplicationCredentialCreate {
+                name: name.to_string(),
+                project_id: project_id.to_string(),
+                roles: roles.to_vec(),
+                secret: Some(secret.into()),
+                user_id: user_id.to_string(),
+                ..Default::default()
+            },
+        )
+        .await?)
+}
+
+#[tokio::test]
+#[traced_test]
+async fn test_authenticate_by_app_cred_id_with_foreign_user_rejected() -> Result<(), Report> {
+    let (state, _) = get_state().await?;
+    let domain = create_domain!(state)?;
+    let project = create_project!(state, domain.id.clone())?;
+    let owner = create_user!(state, domain.id.clone())?;
+    let other = create_user!(state, domain.id.clone())?;
+    let cred = create_cred(
+        &state,
+        &project.id,
+        &owner.id,
+        &Uuid::new_v4().to_string(),
+        "s3cr3t",
+        &[],
+    )
+    .await?;
+    let provider = state.provider.get_application_credential_provider();
+    let ctx = ExecutionContext::internal(&state);
+
+    let mut req = auth_request_by_id(&cred.id, "s3cr3t");
+    let ApplicationCredentialAuthData::Id(by_id) = &mut req.credential else {
+        unreachable!()
+    };
+    by_id.user = Some(UserAuthRef {
+        id: Some(other.id.clone()),
+        name: None,
+        domain: None,
+    });
+    assert!(
+        matches!(
+            provider
+                .authenticate_by_application_credential(&ctx, &req)
+                .await,
+            Err(ApplicationCredentialProviderError::AuthenticationFailed)
+        ),
+        "credential of another user must not authenticate"
+    );
+
+    // The matching user reference is accepted.
+    let ApplicationCredentialAuthData::Id(by_id) = &mut req.credential else {
+        unreachable!()
+    };
+    by_id.user = Some(UserAuthRef {
+        id: Some(owner.id.clone()),
+        name: None,
+        domain: None,
+    });
+    provider
+        .authenticate_by_application_credential(&ctx, &req)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[traced_test]
+async fn test_authenticate_by_app_cred_name_with_user_name_and_domain() -> Result<(), Report> {
+    let (state, _) = get_state().await?;
+    let domain = create_domain!(state)?;
+    let project = create_project!(state, domain.id.clone())?;
+    let user = create_user!(state, domain.id.clone())?;
+    let name = Uuid::new_v4().to_string();
+    create_cred(&state, &project.id, &user.id, &name, "s3cr3t", &[]).await?;
+    let provider = state.provider.get_application_credential_provider();
+    let ctx = ExecutionContext::internal(&state);
+
+    let by_name = |user: UserAuthRef| ApplicationCredentialAuthRequest {
+        secret: "s3cr3t".into(),
+        credential: ApplicationCredentialAuthData::Name(ApplicationCredentialAuthByName {
+            name: name.clone(),
+            user,
+        }),
+    };
+
+    // user ID
+    provider
+        .authenticate_by_application_credential(
+            &ctx,
+            &by_name(UserAuthRef {
+                id: Some(user.id.clone()),
+                name: None,
+                domain: None,
+            }),
+        )
+        .await?;
+    // user name + domain ID
+    provider
+        .authenticate_by_application_credential(
+            &ctx,
+            &by_name(UserAuthRef {
+                id: None,
+                name: Some(user.name.clone()),
+                domain: Some(openstack_keystone_core_types::scope::Domain {
+                    id: Some(domain.id.clone()),
+                    name: None,
+                }),
+            }),
+        )
+        .await?;
+    // user name + domain name
+    provider
+        .authenticate_by_application_credential(
+            &ctx,
+            &by_name(UserAuthRef {
+                id: None,
+                name: Some(user.name.clone()),
+                domain: Some(openstack_keystone_core_types::scope::Domain {
+                    id: None,
+                    name: Some(domain.name.clone()),
+                }),
+            }),
+        )
+        .await?;
+    // user name without domain is not enough
+    assert!(matches!(
+        provider
+            .authenticate_by_application_credential(
+                &ctx,
+                &by_name(UserAuthRef {
+                    id: None,
+                    name: Some(user.name.clone()),
+                    domain: None,
+                }),
+            )
+            .await,
+        Err(ApplicationCredentialProviderError::AuthenticationFailed)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+#[traced_test]
+async fn test_issue_token_app_cred_scope_rules() -> Result<(), Report> {
+    let (state, _) = get_state().await?;
+    let domain = create_domain!(state)?;
+    let project = create_project!(state, domain.id.clone())?;
+    let user = create_user!(state, domain.id.clone())?;
+    let role = create_role!(state)?;
+    state
+        .provider
+        .get_assignment_provider()
+        .create_grant(
+            &ExecutionContext::internal(&state),
+            openstack_keystone_core_types::assignment::AssignmentCreate::user_project(
+                &user.id,
+                &project.id,
+                &role.id,
+                false,
+            ),
+        )
+        .await?;
+    let cred = create_cred(
+        &state,
+        &project.id,
+        &user.id,
+        &Uuid::new_v4().to_string(),
+        "s3cr3t",
+        &[RoleRef::from(role.deref().clone())],
+    )
+    .await?;
+
+    let auth_result = state
+        .provider
+        .get_application_credential_provider()
+        .authenticate_by_application_credential(
+            &ExecutionContext::internal(&state),
+            &auth_request_by_id(&cred.id, "s3cr3t"),
+        )
+        .await?;
+    let ctx = SecurityContext::try_from(auth_result)?;
+    let token_provider = state.provider.get_token_provider();
+
+    // Even the credential's own project must not be requested explicitly.
+    let own_project_scope = ScopeInfo::Project {
+        project: openstack_keystone_core_types::resource::ProjectBuilder::default()
+            .id(&project.id)
+            .name("own")
+            .domain_id(&domain.id)
+            .enabled(true)
+            .build()?,
+        project_domain: openstack_keystone_core_types::resource::DomainBuilder::default()
+            .id(&domain.id)
+            .name("test")
+            .enabled(true)
+            .build()?,
+    };
+    assert!(
+        matches!(
+            token_provider
+                .issue_token_context(&state, &ctx, &own_project_scope)
+                .await,
+            Err(TokenProviderError::Authentication(
+                AuthenticationError::ScopeNotAllowed
+            ))
+        ),
+        "explicit scope must be rejected for app cred authentication"
+    );
+
+    // Without scope, the project scope is derived from the credential.
+    let vsc = token_provider
+        .issue_token_context(&state, &ctx, &ScopeInfo::Unscoped)
+        .await?;
+    assert!(matches!(
+        vsc.inner().authorization().map(|a| &a.scope),
+        Some(ScopeInfo::Project { project: p, .. }) if p.id == project.id
+    ));
+
+    // An application credential token cannot be exchanged for a scoped one.
+    let reauth = SecurityContext::try_from(
+        AuthenticationResultBuilder::default()
+            .context(AuthenticationContext::ApplicationCredential {
+                application_credential: ApplicationCredential::from(cred.clone()),
+                token: Some(vsc.token()?.clone()),
+            })
+            .principal(ctx.principal().clone())
+            .build()?,
+    )?;
+    assert!(
+        matches!(
+            token_provider
+                .issue_token_context(&state, &reauth, &own_project_scope)
+                .await,
+            Err(TokenProviderError::Authentication(
+                AuthenticationError::ScopeNotAllowed
+            ))
+        ),
+        "scope must be rejected when exchanging an app cred token"
+    );
+    // Without scope the exchange derives the project scope again.
+    let exchanged = token_provider
+        .issue_token_context(&state, &reauth, &ScopeInfo::Unscoped)
+        .await?;
+    assert!(matches!(
+        exchanged.inner().authorization().map(|a| &a.scope),
+        Some(ScopeInfo::Project { project: p, .. }) if p.id == project.id
+    ));
 
     Ok(())
 }

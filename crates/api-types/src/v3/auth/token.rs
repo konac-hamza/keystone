@@ -408,7 +408,7 @@ fn validate_token_auth_secret(value: &TokenAuth) -> Result<(), validator::Valida
     feature = "builder",
     derive(derive_builder::Builder),
     builder(
-        build_fn(error = "crate::error::BuilderError"),
+        build_fn(error = "crate::error::BuilderError", validate = "Self::validate"),
         setter(strip_option, into)
     )
 )]
@@ -427,8 +427,6 @@ pub struct ApplicationCredentialAuth {
     #[cfg_attr(feature = "builder", builder(default))]
     #[cfg_attr(feature = "validate", validate(length(max = 255)))]
     pub name: Option<String>,
-    /// Application credential secret. Required for direct authentication,
-    /// absent when the payload is relabeled by a route-mode plugin.
     /// Application credential secret.
     #[cfg_attr(feature = "openapi", schema(value_type = String))]
     #[serde(serialize_with = "crate::common::serialize_secret_string")]
@@ -438,6 +436,18 @@ pub struct ApplicationCredentialAuth {
     #[cfg_attr(feature = "builder", builder(default))]
     #[cfg_attr(feature = "validate", validate(nested))]
     pub user: Option<ApplicationCredentialUser>,
+}
+
+#[cfg(feature = "builder")]
+impl ApplicationCredentialAuthBuilder {
+    fn validate(&self) -> Result<(), String> {
+        let has_id = self.id.as_ref().is_some_and(|v| v.is_some());
+        let has_name = self.name.as_ref().is_some_and(|v| v.is_some());
+        if !has_id && !has_name {
+            return Err("application credential requires at least id or name".into());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "validate")]
@@ -534,6 +544,44 @@ mod tests {
     use super::*;
 
     const PWD: &str = "hunter2-plaintext";
+
+    #[cfg(feature = "builder")]
+    #[test]
+    fn application_credential_auth_builder_requires_id_or_name() {
+        assert!(
+            ApplicationCredentialAuthBuilder::default()
+                .secret("secret")
+                .build()
+                .is_err(),
+            "neither id nor name"
+        );
+        assert!(
+            ApplicationCredentialAuthBuilder::default()
+                .id("id")
+                .secret("secret")
+                .build()
+                .is_ok()
+        );
+        assert!(
+            ApplicationCredentialAuthBuilder::default()
+                .name("name")
+                .secret("secret")
+                .build()
+                .is_ok()
+        );
+    }
+
+    #[cfg(feature = "builder")]
+    #[test]
+    fn application_credential_user_builder_requires_id_or_name() {
+        assert!(ApplicationCredentialUserBuilder::default().build().is_err());
+        assert!(
+            ApplicationCredentialUserBuilder::default()
+                .id("uid")
+                .build()
+                .is_ok()
+        );
+    }
 
     #[test]
     fn validate_token_parameters_accepts_lenient_bool_query_values() {

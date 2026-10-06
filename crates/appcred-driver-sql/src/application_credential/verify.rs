@@ -33,12 +33,22 @@ pub async fn verify_secret(
     credential_id: &str,
     secret: &SecretString,
 ) -> Result<(), ApplicationCredentialProviderError> {
-    let record = DbApplicationCredential::find()
+    let Some(record) = DbApplicationCredential::find()
         .filter(db_application_credential::Column::Id.eq(credential_id))
         .one(db)
         .await
         .context("looking up application credential for authentication")?
-        .ok_or(ApplicationCredentialProviderError::AuthenticationFailed)?;
+    else {
+        // Prevent timing attacks: burn a dummy hash verification so the
+        // "not found" path takes comparable time to the "wrong secret" one.
+        let dummy_hash = password_hashing::get_or_init_dummy_hash(config)
+            .await
+            .map_err(ApplicationCredentialProviderError::password_hash)?;
+        let _ = password_hashing::verify_password(config, secret, dummy_hash)
+            .await
+            .map_err(ApplicationCredentialProviderError::password_hash)?;
+        return Err(ApplicationCredentialProviderError::AuthenticationFailed);
+    };
 
     // record is db_application_credential::Model, which has secret_hash
     let matched = password_hashing::verify_password(config, secret, &record.secret_hash)
