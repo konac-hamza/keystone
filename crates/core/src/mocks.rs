@@ -743,6 +743,12 @@ mod assignment {
 
         #[async_trait]
         impl AssignmentApi for AssignmentProvider {
+            async fn check_grant<'a>(
+                &self,
+                ctx: &ExecutionContext<'a>,
+                params: &Assignment,
+            ) -> Result<bool, AssignmentProviderError>;
+
             async fn create_grant<'a>(
                 &self,
                 ctx: &ExecutionContext<'a>,

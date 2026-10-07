@@ -533,6 +533,18 @@ impl AssignmentApi for AssignmentService {
     /// # Returns
     /// - `Result<Assignment, AssignmentProviderError>` - The created assignment
     ///   or an error.
+    async fn check_grant<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        grant: &Assignment,
+    ) -> Result<bool, AssignmentProviderError> {
+        let bundle = self.bundle.load_full();
+        let backend_driver = self
+            .driver_for_target(ctx, &bundle, target_kind(&grant.r#type), &grant.target_id)
+            .await?;
+        backend_driver.check_grant(ctx.state(), grant).await
+    }
+
     async fn create_grant<'a>(
         &self,
         ctx: &ExecutionContext<'a>,

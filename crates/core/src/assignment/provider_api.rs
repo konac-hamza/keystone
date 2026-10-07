@@ -23,6 +23,21 @@ use openstack_keystone_core_types::assignment::*;
 /// `actors` and `objects`.
 #[async_trait]
 pub trait AssignmentApi: Send + Sync {
+    /// Check whether an assignment grant exists.
+    ///
+    /// # Parameters
+    /// - `ctx`: The execution context.
+    /// - `params`: The assignment to check.
+    ///
+    /// # Returns
+    /// - `Result<bool, AssignmentProviderError>` - True if the grant exists,
+    ///   false otherwise, or an error.
+    async fn check_grant<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        params: &Assignment,
+    ) -> Result<bool, AssignmentProviderError>;
+
     /// Create assignment grant.
     ///
     /// # Parameters
