@@ -26,6 +26,7 @@ use openstack_keystone_core_types::assignment::RoleAssignmentListParameters;
 
 use crate::api::auth::Auth;
 use crate::api::error::KeystoneApiError;
+use crate::api::v3::role_assignment::system::policy_target;
 use crate::keystone::ServiceState;
 use openstack_keystone_core::auth::ExecutionContext;
 
@@ -78,30 +79,33 @@ pub(super) async fn check(
             .get_assignment_provider()
             .list_role_assignments(exec, &query_params)
     );
-    let user = user?.ok_or_else(|| {
-        info!("User {} was not found", user_id);
-        KeystoneApiError::NotFound {
-            resource: "grant".into(),
-            identifier: "".into(),
-        }
-    })?;
-    let role = role?.ok_or_else(|| {
-        info!("Role {} was not found", role_id);
-        KeystoneApiError::NotFound {
-            resource: "grant".into(),
-            identifier: "".into(),
-        }
-    })?;
+    let user = user?;
+    let role = role?;
 
     state
         .policy_enforcer
         .enforce(
             "identity/system/user/role/check",
             &user_auth,
-            json!({"user": user, "role": role}),
+            json!({"user": policy_target(&user, &user_id), "role": policy_target(&role, &role_id)}),
             None,
         )
         .await?;
+
+    user.ok_or_else(|| {
+        info!("User {} was not found", user_id);
+        KeystoneApiError::NotFound {
+            resource: "grant".into(),
+            identifier: "".into(),
+        }
+    })?;
+    role.ok_or_else(|| {
+        info!("Role {} was not found", role_id);
+        KeystoneApiError::NotFound {
+            resource: "grant".into(),
+            identifier: "".into(),
+        }
+    })?;
 
     let grants: Vec<Assignment> = assignments?.into_iter().collect();
 

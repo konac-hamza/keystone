@@ -19,6 +19,16 @@ use crate::keystone::ServiceState;
 mod group;
 mod user;
 
+/// Policy target for an object that may not exist.
+///
+/// Policy is evaluated before a missing group/user/role is reported as 404,
+/// so that unauthorized callers cannot probe for the existence of ids.
+pub(crate) fn policy_target<T: serde::Serialize>(obj: &Option<T>, id: &str) -> serde_json::Value {
+    obj.as_ref()
+        .and_then(|x| serde_json::to_value(x).ok())
+        .unwrap_or_else(|| serde_json::json!({"id": id}))
+}
+
 pub(crate) fn openapi_router() -> OpenApiRouter<ServiceState> {
     OpenApiRouter::new()
         .merge(user::openapi_router())

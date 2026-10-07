@@ -28,6 +28,7 @@ use openstack_keystone_core_types::assignment::RoleAssignmentListParameters;
 
 use crate::api::auth::Auth;
 use crate::api::error::KeystoneApiError;
+use crate::api::v3::role_assignment::system::policy_target;
 use crate::keystone::ServiceState;
 use openstack_keystone_core::auth::ExecutionContext;
 
@@ -77,23 +78,25 @@ pub(super) async fn list(
             .get_assignment_provider()
             .list_role_assignments(exec, &query_params)
     );
-    let user = user?.ok_or_else(|| {
-        info!("User {} was not found", user_id);
-        KeystoneApiError::NotFound {
-            resource: "grant".into(),
-            identifier: "".into(),
-        }
-    })?;
+    let user = user?;
 
     state
         .policy_enforcer
         .enforce(
             "identity/system/user/role/list",
             &user_auth,
-            json!({"user": user}),
+            json!({"user": policy_target(&user, &user_id)}),
             None,
         )
         .await?;
+
+    user.ok_or_else(|| {
+        info!("User {} was not found", user_id);
+        KeystoneApiError::NotFound {
+            resource: "grant".into(),
+            identifier: "".into(),
+        }
+    })?;
 
     let assignments = assignments?;
     // Collect to HashSet<Role> to deduplicate, then convert to Vec for API

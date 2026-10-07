@@ -25,8 +25,10 @@ use openstack_keystone_core_types::assignment::AssignmentCreate;
 
 use crate::api::auth::Auth;
 use crate::api::error::KeystoneApiError;
+use crate::api::v3::role_assignment::system::policy_target;
 use crate::keystone::ServiceState;
 use openstack_keystone_core::auth::ExecutionContext;
+
 /// Assign role to group on system
 ///
 /// Assigns a role to a group on the system.
@@ -40,6 +42,8 @@ use openstack_keystone_core::auth::ExecutionContext;
     ),
     responses(
         (status = NO_CONTENT, description = "Grant is created."),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
         (status = 404, description = "Grant not found", example = json!(KeystoneApiError::NotFound(String::from("id = 1"))))
     ),
     security(("x-auth" = [])),
@@ -65,30 +69,33 @@ pub(super) async fn grant(
             .get_group(exec, &group_id),
         state.provider.get_role_provider().get_role(exec, &role_id),
     );
-    let group = group?.ok_or_else(|| {
-        info!("Group {} was not found", group_id);
-        KeystoneApiError::NotFound {
-            resource: "grant".into(),
-            identifier: "".into(),
-        }
-    })?;
-    let role = role?.ok_or_else(|| {
-        info!("Role {} was not found", role_id);
-        KeystoneApiError::NotFound {
-            resource: "grant".into(),
-            identifier: "".into(),
-        }
-    })?;
+    let group = group?;
+    let role = role?;
 
     state
         .policy_enforcer
         .enforce(
             "identity/system/group/role/grant",
             &user_auth,
-            json!({"group": group, "role": role}),
+            json!({"group": policy_target(&group, &group_id), "role": policy_target(&role, &role_id)}),
             None,
         )
         .await?;
+
+    let group = group.ok_or_else(|| {
+        info!("Group {} was not found", group_id);
+        KeystoneApiError::NotFound {
+            resource: "group".into(),
+            identifier: group_id.clone(),
+        }
+    })?;
+    let role = role.ok_or_else(|| {
+        info!("Role {} was not found", role_id);
+        KeystoneApiError::NotFound {
+            resource: "role".into(),
+            identifier: role_id.clone(),
+        }
+    })?;
 
     state
         .provider

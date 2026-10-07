@@ -22,13 +22,14 @@ use axum::{
 use serde_json::json;
 use tracing::info;
 
-use openstack_keystone_core_types::assignment::Assignment;
-use openstack_keystone_core_types::assignment::RoleAssignmentListParameters;
+use openstack_keystone_core_types::assignment::{AssignmentBuilder, AssignmentType};
 
 use crate::api::auth::Auth;
 use crate::api::error::KeystoneApiError;
+use crate::api::v3::role_assignment::system::policy_target;
 use crate::keystone::ServiceState;
 use openstack_keystone_core::auth::ExecutionContext;
+
 /// Check whether group has role assignment on system.
 ///
 /// Validates that a group has a role on the system.
@@ -48,7 +49,7 @@ use openstack_keystone_core::auth::ExecutionContext;
     tag="role_assignments"
 )]
 #[tracing::instrument(
-    name = "api::system_group_role_check",
+    name = "api::v3::system_group_role_check",
     level = "debug",
     skip(state, user_auth),
     err(Debug)
@@ -58,54 +59,56 @@ pub(super) async fn check(
     Path((group_id, role_id)): Path<(String, String)>,
     State(state): State<ServiceState>,
 ) -> Result<impl IntoResponse, KeystoneApiError> {
-    let query_params = RoleAssignmentListParameters {
-        group_id: Some(group_id.clone()),
-        system_id: Some("system".into()),
-        effective: Some(true),
-        include_names: Some(false),
-        resolve_implied_roles: false,
-        ..Default::default()
-    };
     let exec = &ExecutionContext::from_auth(&state, &user_auth);
-    let (group, role, assignments) = tokio::join!(
+    let (group, role) = tokio::join!(
         state
             .provider
             .get_identity_provider()
             .get_group(exec, &group_id),
         state.provider.get_role_provider().get_role(exec, &role_id),
-        state
-            .provider
-            .get_assignment_provider()
-            .list_role_assignments(exec, &query_params)
     );
-    let group = group?.ok_or_else(|| {
-        info!("Group {} was not found", group_id);
-        KeystoneApiError::NotFound {
-            resource: "grant".into(),
-            identifier: "".into(),
-        }
-    })?;
-    let role = role?.ok_or_else(|| {
-        info!("Role {} was not found", role_id);
-        KeystoneApiError::NotFound {
-            resource: "grant".into(),
-            identifier: "".into(),
-        }
-    })?;
+    let group = group?;
+    let role = role?;
 
     state
         .policy_enforcer
         .enforce(
             "identity/system/group/role/check",
             &user_auth,
-            json!({"group": group, "role": role}),
+            json!({"group": policy_target(&group, &group_id), "role": policy_target(&role, &role_id)}),
             None,
         )
         .await?;
 
-    let grants: Vec<Assignment> = assignments?.into_iter().collect();
+    group.ok_or_else(|| {
+        info!("Group {} was not found", group_id);
+        KeystoneApiError::NotFound {
+            resource: "group".into(),
+            identifier: group_id.clone(),
+        }
+    })?;
+    role.ok_or_else(|| {
+        info!("Role {} was not found", role_id);
+        KeystoneApiError::NotFound {
+            resource: "role".into(),
+            identifier: role_id.clone(),
+        }
+    })?;
 
-    if grants.into_iter().any(|x| x.role_id == role_id) {
+    let grant = AssignmentBuilder::default()
+        .actor_id(group_id)
+        .role_id(role_id)
+        .target_id("system")
+        .r#type(AssignmentType::GroupSystem)
+        .inherited(false)
+        .build()?;
+
+    if state
+        .provider
+        .get_assignment_provider()
+        .check_grant(exec, &grant)
+        .await?
+    {
         Ok(StatusCode::NO_CONTENT.into_response())
     } else {
         Err(KeystoneApiError::NotFound {
@@ -114,6 +117,7 @@ pub(super) async fn check(
         })
     }
 }
+
 #[cfg(test)]
 mod tests {
     use axum::{
@@ -155,24 +159,14 @@ mod tests {
 
         let mut assignment_mock = MockAssignmentProvider::default();
         assignment_mock
-            .expect_list_role_assignments()
-            .withf(|_, params: &RoleAssignmentListParameters| {
-                params.role_id.is_none()
-                    && params.group_id.as_ref().is_some_and(|x| x == "group_id")
-                    && params.system_id.as_ref().is_some_and(|x| x == "system")
-                    && params.effective.is_some_and(|x| x)
+            .expect_check_grant()
+            .withf(|_, g: &Assignment| {
+                g.actor_id == "group_id"
+                    && g.role_id == "role_id"
+                    && g.target_id == "system"
+                    && g.r#type == AssignmentType::GroupSystem
             })
-            .returning(|_, _| {
-                Ok(vec![Assignment {
-                    role_id: "role_id".into(),
-                    role_name: Some("rn".into()),
-                    actor_id: "group_id".into(),
-                    target_id: "system".into(),
-                    r#type: AssignmentType::GroupSystem,
-                    inherited: false,
-                    implied_via: None,
-                }])
-            });
+            .returning(|_, _| Ok(true));
 
         let mut role_mock = MockRoleProvider::default();
         role_mock
@@ -234,14 +228,14 @@ mod tests {
 
         let mut assignment_mock = MockAssignmentProvider::default();
         assignment_mock
-            .expect_list_role_assignments()
-            .withf(|_, params: &RoleAssignmentListParameters| {
-                params.role_id.is_none()
-                    && params.group_id.as_ref().is_some_and(|x| x == "group_id")
-                    && params.system_id.as_ref().is_some_and(|x| x == "system")
-                    && params.effective.is_some_and(|x| x)
+            .expect_check_grant()
+            .withf(|_, g: &Assignment| {
+                g.actor_id == "group_id"
+                    && g.role_id == "role_id"
+                    && g.target_id == "system"
+                    && g.r#type == AssignmentType::GroupSystem
             })
-            .returning(|_, _| Ok(vec![]));
+            .returning(|_, _| Ok(false));
 
         let mut role_mock = MockRoleProvider::default();
         role_mock
@@ -303,24 +297,14 @@ mod tests {
 
         let mut assignment_mock = MockAssignmentProvider::default();
         assignment_mock
-            .expect_list_role_assignments()
-            .withf(|_, params: &RoleAssignmentListParameters| {
-                params.role_id.is_none()
-                    && params.group_id.as_ref().is_some_and(|x| x == "group_id")
-                    && params.system_id.as_ref().is_some_and(|x| x == "system")
-                    && params.effective.is_some_and(|x| x)
+            .expect_check_grant()
+            .withf(|_, g: &Assignment| {
+                g.actor_id == "group_id"
+                    && g.role_id == "role_id"
+                    && g.target_id == "system"
+                    && g.r#type == AssignmentType::GroupSystem
             })
-            .returning(|_, _| {
-                Ok(vec![Assignment {
-                    role_id: "role_id".into(),
-                    role_name: Some("rn".into()),
-                    actor_id: "group_id".into(),
-                    target_id: "system".into(),
-                    r#type: AssignmentType::GroupSystem,
-                    inherited: false,
-                    implied_via: None,
-                }])
-            });
+            .returning(|_, _| Ok(false));
 
         let mut role_mock = MockRoleProvider::default();
         role_mock
@@ -373,11 +357,14 @@ mod tests {
 
         let mut assignment_mock = MockAssignmentProvider::default();
         assignment_mock
-            .expect_list_role_assignments()
-            .withf(|_, params: &RoleAssignmentListParameters| {
-                params.system_id.as_ref().is_some_and(|x| x == "system")
+            .expect_check_grant()
+            .withf(|_, g: &Assignment| {
+                g.actor_id == "group_id"
+                    && g.role_id == "role_id"
+                    && g.target_id == "system"
+                    && g.r#type == AssignmentType::GroupSystem
             })
-            .returning(|_, _| Ok(vec![]));
+            .returning(|_, _| Ok(false));
 
         let mut role_mock = MockRoleProvider::default();
         role_mock

@@ -13,21 +13,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! System group role: list.
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//
-// SPDX-License-Identifier: Apache-2.0
-
-//! System group role: list.
 use axum::{
     Json,
     extract::{Path, State},
@@ -43,8 +28,10 @@ use openstack_keystone_core_types::assignment::RoleAssignmentListParameters;
 
 use crate::api::auth::Auth;
 use crate::api::error::KeystoneApiError;
+use crate::api::v3::role_assignment::system::policy_target;
 use crate::keystone::ServiceState;
 use openstack_keystone_core::auth::ExecutionContext;
+
 /// List the roles that a group has on the system.
 #[utoipa::path(
     get,
@@ -61,7 +48,7 @@ use openstack_keystone_core::auth::ExecutionContext;
     tag="role_assignments"
 )]
 #[tracing::instrument(
-    name = "api::system_group_role_list",
+    name = "api::v3::system_group_role_list",
     level = "debug",
     skip(state, user_auth),
     err(Debug)
@@ -91,32 +78,36 @@ pub(super) async fn list(
             .get_assignment_provider()
             .list_role_assignments(exec, &query_params)
     );
-    let group = group?.ok_or_else(|| {
-        info!("Group {} was not found", group_id);
-        KeystoneApiError::NotFound {
-            resource: "group".into(),
-            identifier: "".into(),
-        }
-    })?;
+    let group = group?;
 
     state
         .policy_enforcer
         .enforce(
             "identity/system/group/role/list",
             &user_auth,
-            json!({"group": group}),
+            json!({"group": policy_target(&group, &group_id)}),
             None,
         )
         .await?;
 
+    group.ok_or_else(|| {
+        info!("Group {} was not found", group_id);
+        KeystoneApiError::NotFound {
+            resource: "group".into(),
+            identifier: group_id.clone(),
+        }
+    })?;
+
     let assignments = assignments?;
-    // Collect to HashSet<Role> to deduplicate, then convert to Vec for API response
-    let roles: Vec<Role> = assignments
+    // Collect to HashSet<Role> to deduplicate, then sort by id for a stable
+    // response order.
+    let mut roles: Vec<Role> = assignments
         .into_iter()
         .map(|a| a.try_into())
         .collect::<Result<std::collections::HashSet<_>, _>>()?
         .into_iter()
         .collect();
+    roles.sort_by(|a, b| a.id.cmp(&b.id));
 
     Ok((StatusCode::OK, Json(RoleAssignmentRoleList { roles })).into_response())
 }

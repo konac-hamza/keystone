@@ -63,6 +63,13 @@ async fn test_revoke_system_role_from_group() -> Result<()> {
             .is_err()
     );
 
+    // Revoking a grant that is already gone must be reported as 404.
+    assert!(
+        revoke_system_group_grant(&test_client, &group.id, member_role)
+            .await
+            .is_err()
+    );
+
     group.delete().await?;
     Ok(())
 }

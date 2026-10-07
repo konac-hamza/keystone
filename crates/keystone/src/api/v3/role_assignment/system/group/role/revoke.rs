@@ -24,9 +24,11 @@ use tracing::info;
 
 use crate::api::auth::Auth;
 use crate::api::error::KeystoneApiError;
+use crate::api::v3::role_assignment::system::policy_target;
 use crate::keystone::ServiceState;
 use openstack_keystone_core::auth::ExecutionContext;
 use openstack_keystone_core_types::assignment::{AssignmentBuilder, AssignmentType};
+
 /// Revoke role from group on system
 ///
 /// Remove a role assignment for a group on the system.
@@ -67,30 +69,33 @@ pub(super) async fn revoke(
             .get_group(exec, &group_id),
         state.provider.get_role_provider().get_role(exec, &role_id)
     );
-    let group = group?.ok_or_else(|| {
-        info!("Group {} was not found", group_id);
-        KeystoneApiError::NotFound {
-            resource: "grant".into(),
-            identifier: "".into(),
-        }
-    })?;
-    let role = role?.ok_or_else(|| {
-        info!("Role {} was not found", role_id);
-        KeystoneApiError::NotFound {
-            resource: "grant".into(),
-            identifier: "".into(),
-        }
-    })?;
+    let group = group?;
+    let role = role?;
 
     state
         .policy_enforcer
         .enforce(
             "identity/system/group/role/revoke",
             &user_auth,
-            json!({"group": group, "role": role}),
+            json!({"group": policy_target(&group, &group_id), "role": policy_target(&role, &role_id)}),
             None,
         )
         .await?;
+
+    group.ok_or_else(|| {
+        info!("Group {} was not found", group_id);
+        KeystoneApiError::NotFound {
+            resource: "group".into(),
+            identifier: group_id.clone(),
+        }
+    })?;
+    role.ok_or_else(|| {
+        info!("Role {} was not found", role_id);
+        KeystoneApiError::NotFound {
+            resource: "role".into(),
+            identifier: role_id.clone(),
+        }
+    })?;
 
     let grant = AssignmentBuilder::default()
         .actor_id(group_id)
@@ -99,6 +104,19 @@ pub(super) async fn revoke(
         .r#type(AssignmentType::GroupSystem)
         .inherited(false)
         .build()?;
+
+    // Revoking a grant that does not exist is a 404 (parity with Python).
+    if !state
+        .provider
+        .get_assignment_provider()
+        .check_grant(exec, &grant)
+        .await?
+    {
+        return Err(KeystoneApiError::NotFound {
+            resource: "grant".into(),
+            identifier: "".into(),
+        });
+    }
 
     state
         .provider
@@ -148,6 +166,9 @@ mod tests {
 
         let mut assignment_mock = MockAssignmentProvider::default();
         assignment_mock
+            .expect_check_grant()
+            .returning(|_, _| Ok(true));
+        assignment_mock
             .expect_revoke_grant()
             .returning(|_, _| Ok(()));
 
@@ -189,6 +210,69 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_revoke_grant_not_found() {
+        let mut identity_mock = MockIdentityProvider::default();
+        identity_mock
+            .expect_get_group()
+            .withf(|_, id: &'_ str| id == "group_id")
+            .returning(|_, _| {
+                Ok(Some(
+                    CoreGroupBuilder::default()
+                        .id("group_id")
+                        .domain_id("did")
+                        .name("gname")
+                        .build()
+                        .unwrap(),
+                ))
+            });
+
+        let mut assignment_mock = MockAssignmentProvider::default();
+        assignment_mock
+            .expect_check_grant()
+            .returning(|_, _| Ok(false));
+        assignment_mock.expect_revoke_grant().never();
+
+        let mut role_mock = MockRoleProvider::default();
+        role_mock
+            .expect_get_role()
+            .withf(|_, rid: &'_ str| rid == "role_id")
+            .returning(|_, _| {
+                Ok(Some(
+                    RoleBuilder::default()
+                        .id("role_id")
+                        .name("new_role")
+                        .build()
+                        .unwrap(),
+                ))
+            });
+
+        let provider_builder = Provider::mocked_builder()
+            .mock_assignment(assignment_mock)
+            .mock_identity(identity_mock)
+            .mock_role(role_mock);
+        let vsc = test_fixture_scoped();
+        let state = get_mocked_state(provider_builder, true, None).await;
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/system/groups/group_id/roles/role_id")
+                    .extension(vsc)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -293,6 +377,54 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_revoke_group_not_found_forbidden_hides_existence() {
+        let mut identity_mock = MockIdentityProvider::default();
+        identity_mock
+            .expect_get_group()
+            .withf(|_, id: &'_ str| id == "group_id")
+            .returning(|_, _| Ok(None));
+
+        let mut role_mock = MockRoleProvider::default();
+        role_mock
+            .expect_get_role()
+            .withf(|_, rid: &'_ str| rid == "role_id")
+            .returning(|_, _| {
+                Ok(Some(
+                    RoleBuilder::default()
+                        .id("role_id")
+                        .name("new_role")
+                        .build()
+                        .unwrap(),
+                ))
+            });
+
+        let provider_builder = Provider::mocked_builder()
+            .mock_identity(identity_mock)
+            .mock_role(role_mock);
+        let vsc = test_fixture_scoped();
+        let state = get_mocked_state(provider_builder, false, None).await;
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/system/groups/group_id/roles/role_id")
+                    .extension(vsc)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
