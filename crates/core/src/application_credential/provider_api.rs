@@ -152,18 +152,22 @@ pub trait ApplicationCredentialApi: Send + Sync {
 
     /// Authenticate using an application credential.
     ///
-    /// Resolves the credential (by ID, or by name + owning user ID),
-    /// verifies the secret, checks that the credential has not expired
-    /// and that the owning user, bound project, and project domain are
-    /// all enabled, then returns an [`AuthenticationResult`] populated
-    /// with [`AuthenticationContext::ApplicationCredential`].
+    /// Resolves the credential (by ID, optionally cross-checked against a
+    /// user reference, or by name + user reference), verifies the secret
+    /// and checks that the credential has not expired, then returns an
+    /// [`AuthenticationResult`] populated with
+    /// [`AuthenticationContext::ApplicationCredential`].
+    ///
+    /// Every failure to identify the credential or the user (unknown
+    /// credential, unknown or mismatching user, wrong secret) yields the
+    /// same [`ApplicationCredentialProviderError::AuthenticationFailed`].
+    /// Enabled checks for the user, the bound project and their domains
+    /// are performed centrally by `ValidatedSecurityContext`, not here.
     ///
     /// # Parameters
     /// - `ctx`: The execution context.
-    /// - `id`: The application credential ID (optional if `name` is given).
-    /// - `name`: The application credential name (optional if `id` is given).
-    /// - `user_id`: The owning user ID (required when resolving by `name`).
-    /// - `secret`: The application credential secret.
+    /// - `auth`: The authentication request (credential ID or name with
+    ///   user reference, and the secret).
     ///
     /// # Returns
     /// - `Result<AuthenticationResult, ApplicationCredentialProviderError>` -

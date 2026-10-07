@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 
 use crate::api::error::KeystoneApiError;
-use crate::api::v3::auth::token::types::AuthRequest;
+use crate::api::v3::auth::token::types::{ApplicationCredentialAuth, AuthRequest};
 use crate::auth::*;
 use crate::keystone::ServiceState;
 use openstack_keystone_config::PluginMode;
@@ -63,6 +63,12 @@ pub(super) async fn authenticate_request(
     let mut effective_extra = req.auth.identity.extra.clone();
     // Mirror the typed application_credential field into effective_extra
     // so route-mode plugins can inspect it (ADR 0025 §4).
+    //
+    // NOTE: the payload includes the plaintext application credential
+    // secret. It is only handed to a `mode = route` plugin that
+    // explicitly lists `application_credential` in its `inspect_methods`
+    // (the operator opts in to trusting that plugin with the secret).
+    // Password and TOTP payloads are not mirrored this way.
     if let Some(app_cred) = &req.auth.identity.application_credential {
         let payload = serde_json::to_value(app_cred).map_err(|e| {
             KeystoneApiError::InternalError(format!(
@@ -191,7 +197,15 @@ pub(super) async fn authenticate_request(
             };
             res.push(auth_res);
         } else if method == "application_credential" {
-            if let Some(app_cred) = &req.auth.identity.application_credential {
+            // Take the payload from `effective_extra`, not from the original
+            // request: a route-mode plugin may have replaced it (or routed
+            // another method here), and its decision must be honoured.
+            let app_cred: Option<ApplicationCredentialAuth> = effective_extra
+                .get("application_credential")
+                .map(|v| serde_json::from_value(v.clone()))
+                .transpose()
+                .map_err(|_| KeystoneApiError::UnauthorizedNoContext)?;
+            if let Some(app_cred) = &app_cred {
                 let credential = if let Some(id) = &app_cred.id {
                     ApplicationCredentialAuthData::Id(ApplicationCredentialAuthById {
                         id: id.clone(),
