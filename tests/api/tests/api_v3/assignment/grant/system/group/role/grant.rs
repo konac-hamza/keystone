@@ -50,6 +50,9 @@ async fn test_grant_system_role_to_group() -> Result<()> {
     add_system_group_grant(&test_client, &group.id, member_role).await?;
     check_grant(&test_client, &group.id, member_role).await?;
 
+    // Granting an existing grant again is idempotent.
+    add_system_group_grant(&test_client, &group.id, member_role).await?;
+
     group.delete().await?;
     Ok(())
 }

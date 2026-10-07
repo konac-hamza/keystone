@@ -311,7 +311,11 @@ cannot be bound to its members and would revoke every token carrying the role
 on that scope (Python bug #1662514). Members lose the role because
 `calculate_effective_roles` re-resolves user, group-membership and assignments
 on **every** token validation, for domain, project and system scope. User
-assignment revocation still creates a `user_id`-bound event. **Why:** an
+assignment revocation still creates a `user_id`-bound event. Roles that are not
+assignment-derived (a token restriction carries its own role set, ADR 15) are
+not re-resolved from assignments by design; the restriction itself is re-read
+on every validation and is what must be changed or deleted to end such a
+token. **Why:** an
 unbound event is a denial of service against unrelated users; no event plus a
 cached role set would be a privilege that outlives its revocation. Both are
 avoided only while roles are never trusted from the token payload. **Where:**

@@ -276,3 +276,44 @@ async fn test_revoke_grant_user_creates_event() {
         );
     }
 }
+
+#[tokio::test]
+async fn test_create_grant_existing_is_idempotent() {
+    let state = get_mocked_state(None, None).await;
+    let mut backend = MockAssignmentBackend::default();
+    backend
+        .expect_create_grant()
+        .returning(|_, _| Err(AssignmentProviderError::Conflict("duplicate".into())));
+    backend.expect_check_grant().returning(|_, _| Ok(true));
+    let provider = AssignmentService::from_backend(Arc::new(backend));
+
+    let res = provider
+        .create_grant(
+            &ExecutionContext::internal(&state),
+            AssignmentCreate::group_system("gid", "system", "rid1", false),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.actor_id, "gid");
+    assert_eq!(res.role_id, "rid1");
+    assert_eq!(res.r#type, AssignmentType::GroupSystem);
+}
+
+#[tokio::test]
+async fn test_create_grant_unrelated_conflict_is_reported() {
+    let state = get_mocked_state(None, None).await;
+    let mut backend = MockAssignmentBackend::default();
+    backend
+        .expect_create_grant()
+        .returning(|_, _| Err(AssignmentProviderError::Conflict("other".into())));
+    backend.expect_check_grant().returning(|_, _| Ok(false));
+    let provider = AssignmentService::from_backend(Arc::new(backend));
+
+    let res = provider
+        .create_grant(
+            &ExecutionContext::internal(&state),
+            AssignmentCreate::group_system("gid", "system", "rid1", false),
+        )
+        .await;
+    assert!(matches!(res, Err(AssignmentProviderError::Conflict(_))));
+}

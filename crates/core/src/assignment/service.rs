@@ -522,6 +522,38 @@ impl AssignmentService {
     }
 }
 
+/// Create a grant, treating an already existing identical grant as success.
+///
+/// Granting a role is idempotent in Python Keystone (`PUT` answers 204 when
+/// the assignment is already present). A backend reports the duplicate as a
+/// conflict; it is only swallowed when the very same grant really exists, so
+/// that other conflicts are still reported.
+async fn create_grant_idempotent(
+    backend: &dyn AssignmentBackend,
+    state: &ServiceState,
+    grant: AssignmentCreate,
+) -> Result<Assignment, AssignmentProviderError> {
+    match backend.create_grant(state, grant.clone()).await {
+        Err(AssignmentProviderError::Conflict(msg)) => {
+            let existing = Assignment {
+                actor_id: grant.actor_id,
+                role_id: grant.role_id,
+                role_name: grant.role_name,
+                target_id: grant.target_id,
+                r#type: grant.r#type,
+                inherited: grant.inherited,
+                implied_via: None,
+            };
+            if backend.check_grant(state, &existing).await? {
+                Ok(existing)
+            } else {
+                Err(AssignmentProviderError::Conflict(msg))
+            }
+        }
+        other => other,
+    }
+}
+
 #[async_trait]
 impl AssignmentApi for AssignmentService {
     /// Check whether the grant exists.
@@ -610,12 +642,13 @@ impl AssignmentApi for AssignmentService {
                     },
                 ),
                 operation: async {
-                    backend_driver.create_grant(ctx.state(), grant_clone).await
+                    create_grant_idempotent(backend_driver.as_ref(), ctx.state(), grant_clone).await
                 },
                 on_audit_error: |_: AuditDispatchError| AssignmentProviderError::Driver("audit dispatch failed".into()),
             }?
         } else {
-            let assignment = backend_driver.create_grant(ctx.state(), grant).await?;
+            let assignment =
+                create_grant_idempotent(backend_driver.as_ref(), ctx.state(), grant).await?;
             ctx.state()
                 .event_dispatcher
                 .emit(Event::new(

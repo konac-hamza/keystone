@@ -116,8 +116,19 @@ cache invalidation and has no Rust counterpart. No option re-enabling the broad
 group event exists, because enabling it would reintroduce the bug.
 
 The group path therefore depends on the validation-time recalculation of
-effective roles. Any change that lets a token carry roles resolved at issuance
-time without re-resolving them on validation must revisit this decision.
+effective roles. This holds for every token whose roles are derived from
+assignments: unrestricted tokens, trusts and application credentials (bounded
+by, and filtered against, the current effective roles of the trustor or user)
+on domain, project and system scope.
+
+Tokens whose roles are **not** derived from assignments are unaffected by
+assignment revocation, for users as well as groups. A token restriction
+(ADR 15) carries its own role set so that a service account needs no direct
+role assignment. The restriction is read again on every validation, so
+deleting or changing it, not revoking an assignment, ends such a token (the
+`user_id`-bound event of a user revocation also hits it as a side effect).
+Any change that lets a token carry roles resolved at issuance time without
+re-resolving them on validation must revisit this decision.
 
 ### Revocation table purge
 
