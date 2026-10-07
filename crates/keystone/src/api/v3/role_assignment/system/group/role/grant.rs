@@ -123,7 +123,9 @@ mod tests {
     use openstack_keystone_core_types::identity::GroupBuilder as CoreGroupBuilder;
     use openstack_keystone_core_types::role::*;
 
-    use crate::api::tests::{get_mocked_state, test_fixture_scoped};
+    use crate::api::tests::{
+        get_capturing_state, get_mocked_state, policy_contract, test_fixture_scoped,
+    };
     use crate::api::v3::role_assignment::openapi_router;
     use crate::assignment::MockAssignmentProvider;
     use crate::identity::MockIdentityProvider;
@@ -189,7 +191,7 @@ mod tests {
             .mock_identity(identity_mock)
             .mock_role(role_mock);
         let vsc = test_fixture_scoped();
-        let state = get_mocked_state(provider_builder, true, None).await;
+        let (state, policy) = get_capturing_state(provider_builder).await;
         let mut api = openapi_router()
             .layer(TraceLayer::new_for_http())
             .with_state(state.clone());
@@ -208,6 +210,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let calls = policy.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].policy_name, "identity/system/group/role/grant");
+        policy_contract::assert_object_keys(&calls[0].target, &["group", "role"]);
+        policy_contract::assert_no_secrets(&calls[0].target);
+        policy_contract::assert_existing_presence(&calls[0].existing, false);
     }
 
     #[tokio::test]

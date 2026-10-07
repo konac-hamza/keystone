@@ -127,7 +127,9 @@ mod tests {
     use openstack_keystone_core_types::assignment::{Assignment, AssignmentType};
     use openstack_keystone_core_types::identity::GroupBuilder as CoreGroupBuilder;
 
-    use crate::api::tests::{get_mocked_state, test_fixture_scoped};
+    use crate::api::tests::{
+        get_capturing_state, get_mocked_state, policy_contract, test_fixture_scoped,
+    };
     use crate::api::v3::role_assignment::openapi_router;
     use crate::assignment::MockAssignmentProvider;
     use crate::identity::MockIdentityProvider;
@@ -167,12 +169,10 @@ mod tests {
         group_mock(&mut identity_mock);
         assignment_mock_empty(&mut assignment_mock);
 
-        let state = get_mocked_state(
+        let (state, policy) = get_capturing_state(
             Provider::mocked_builder()
                 .mock_identity(identity_mock)
                 .mock_assignment(assignment_mock),
-            true,
-            None,
         )
         .await;
 
@@ -194,6 +194,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+
+        let calls = policy.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].policy_name, "identity/system/group/role/list");
+        policy_contract::assert_object_keys(&calls[0].target, &["group"]);
+        policy_contract::assert_no_secrets(&calls[0].target);
+        policy_contract::assert_existing_presence(&calls[0].existing, false);
     }
 
     #[tokio::test]
