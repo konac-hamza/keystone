@@ -524,15 +524,14 @@ impl AssignmentService {
 
 #[async_trait]
 impl AssignmentApi for AssignmentService {
-    /// Create assignment grant.
+    /// Check whether the grant exists.
     ///
     /// # Parameters
-    /// - `state`: The current service state.
-    /// - `grant`: The assignment creation parameters.
+    /// - `ctx`: The execution context.
+    /// - `grant`: The assignment to check.
     ///
     /// # Returns
-    /// - `Result<Assignment, AssignmentProviderError>` - The created assignment
-    ///   or an error.
+    /// - `Result<bool, AssignmentProviderError>` - True if the grant exists.
     async fn check_grant<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
@@ -545,6 +544,15 @@ impl AssignmentApi for AssignmentService {
         backend_driver.check_grant(ctx.state(), grant).await
     }
 
+    /// Create assignment grant.
+    ///
+    /// # Parameters
+    /// - `state`: The current service state.
+    /// - `grant`: The assignment creation parameters.
+    ///
+    /// # Returns
+    /// - `Result<Assignment, AssignmentProviderError>` - The created assignment
+    ///   or an error.
     async fn create_grant<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
