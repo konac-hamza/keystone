@@ -156,6 +156,12 @@ subsystem in follow-up PRs (mirroring ADR 0023's phasing), not all at once.
 | `keystone_token_validated_total` | counter | `driver`, `outcome` | Validation volume/outcome |
 | `keystone_token_validation_duration_seconds` | histogram | `driver` | Validation latency |
 | `keystone_token_revoked_total` | counter | `reason` (user_request/admin/cascade/expired_trust) | Revocation volume |
+
+`reason="cascade"` counts revocation events created as a side effect of revoking
+a role assignment. Only **user** assignments cascade; revoking a **group**
+assignment creates no revocation event (effective roles are recalculated on
+every token validation, see [ADR 9](0009-auth-token-revoke.md)) and therefore
+does not increment the counter.
 | `keystone_token_revocation_list_size` | gauge | — | In-memory/DB revocation-event backlog |
 
 #### Policy (OPA)

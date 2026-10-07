@@ -92,6 +92,33 @@ While following checks allow much higher details of the revocation events in the
 context of the usual fernet token revocation it is only going to match on the
 `audit_id` and `issued_before`.
 
+### Role assignment revocation
+
+Revoking a role assignment (`revoke_grant`) cascades into token revocation:
+
+- A **user** assignment (`UserDomain`, `UserProject`, `UserSystem`) inserts a
+  revocation event with `user_id`, `role_id` and the project or domain
+  (system assignments have neither), so only tokens of that user carrying that
+  role are invalidated.
+- A **group** assignment (`GroupDomain`, `GroupProject`, `GroupSystem`) does
+  **not** insert a revocation event. An event for a group cannot be bound to
+  the group members (`user_id` stays empty), so it would invalidate every token
+  carrying the role on that scope, including the tokens of users who hold the
+  role through a direct assignment or another group. This is Python Keystone
+  bug #1662514. Instead the effective roles of a token are recalculated on
+  every validation (user, then the groups of the user, then the assignments of
+  all of them, for domain, project and system scope), so group members lose
+  the revoked role immediately without an event.
+
+Python Keystone behaves the same way: it never persists such an event for a
+group. Its `[token] revoke_by_id` option only gates a non-destructive token
+cache invalidation and has no Rust counterpart. No option re-enabling the broad
+group event exists, because enabling it would reintroduce the bug.
+
+The group path therefore depends on the validation-time recalculation of
+effective roles. Any change that lets a token carry roles resolved at issuance
+time without re-resolving them on validation must revisit this decision.
+
 ### Revocation table purge
 
 In the python Keystone there is no automatic cleanup handling. Due to that

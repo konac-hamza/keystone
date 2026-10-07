@@ -830,26 +830,15 @@ impl AssignmentApi for AssignmentService {
             audit_chain_id: None,
             revoked_at: chrono::Utc::now(),
         };
-        // Only create revocation event for group assignments if revoke_by_id is enabled.
-        // By default group revocations do not create revocation events since token
-        // validation rebuilds assignments at validation time.
-        // Reference: Python Keystone bug #1662514
-        let is_group_assignment = matches!(
+        // A revocation event cannot be bound to the members of a group: it
+        // would revoke every token carrying the role on that scope, including
+        // those of users holding the role through a direct assignment (Python
+        // Keystone bug #1662514). Effective roles are recalculated on every
+        // token validation, so members lose a revoked group role without it.
+        if matches!(
             &grant.r#type,
-            AssignmentType::GroupDomain
-                | AssignmentType::GroupProject
-                | AssignmentType::GroupSystem
-        );
-
-        let revoke_by_id = ctx
-            .state()
-            .config_manager
-            .config
-            .read()
-            .await
-            .token
-            .revoke_by_id;
-        if !is_group_assignment || revoke_by_id {
+            AssignmentType::UserDomain | AssignmentType::UserProject | AssignmentType::UserSystem
+        ) {
             // ADR 0034 §4: the central revocation event stays on the global revoke
             // provider, unrouted — it is not an assignment-backend operation.
             ctx.state()

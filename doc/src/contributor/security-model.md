@@ -303,6 +303,33 @@ privileged listers whose rows legitimately do get filtered.
 > scan happens anyway. In `credential/list` both read a single parsed
 > `CredentialListParameters`, so they cannot diverge.
 
+### I9 — Group role revocation relies on validation-time role recalculation
+
+**What:** revoking a group role assignment (`GroupDomain`, `GroupProject`,
+`GroupSystem`) creates **no** revocation event, because an event for a group
+cannot be bound to its members and would revoke every token carrying the role
+on that scope (Python bug #1662514). Members lose the role because
+`calculate_effective_roles` re-resolves user, group-membership and assignments
+on **every** token validation, for domain, project and system scope. User
+assignment revocation still creates a `user_id`-bound event. **Why:** an
+unbound event is a denial of service against unrelated users; no event plus a
+cached role set would be a privilege that outlives its revocation. Both are
+avoided only while roles are never trusted from the token payload. **Where:**
+`crates/core/src/assignment/service.rs` (`revoke_grant`),
+`crates/core/src/auth.rs` (`calculate_effective_roles`),
+`crates/assignment-driver-sql/src/lib.rs` (`list_assignments`, user to groups
+expansion). There is intentionally no config switch to restore the broad event;
+see [ADR 9](../adr/0009-auth-token-revoke.md).
+
+### I10 — Existence is not disclosed before authorization
+
+**What:** a handler that looks up a path object (user, group, role) before
+enforcing policy must still enforce policy when the object is missing, using an
+id-only target, and only then report 404. **Why:** a 404/403 split lets an
+unauthorized caller enumerate ids. **Where:**
+`crates/keystone/src/api/v3/role_assignment/system/mod.rs` (`policy_target`),
+used by every `system/{users,groups}/.../roles` handler.
+
 ## 5. Delegated-auth specifics
 
 Trust, application-credential, and EC2 are authentication _methods_, each with
@@ -411,6 +438,12 @@ carries it, ticked by the reviewer, not just this prose reference.
       filters by** (I8a)?
 - [ ] Does the change let a narrow auth method be **broadened by a
       request-supplied scope** (I5)?
+- [ ] Does the change revoke or invalidate something **without** a revocation
+      event (like group role revocation)? Is the effect guaranteed by
+      **recomputation on every validation**, never by data cached in the token
+      (I9)?
+- [ ] Handler looks up a path object before policy? Does a **missing** object
+      still go through policy before the 404 (I10)?
 - [ ] New state-changing provider method? Is it wrapped in `audited_op!` /
       `audited_if_ctx!` (fail-closed `attempt` record, static failure reason),
       or listed with a reason in the `audit_coverage` allow-list?
