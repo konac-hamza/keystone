@@ -932,3 +932,132 @@ async fn test_auth_by_application_credential_generated_secret() -> Result<()> {
     project.delete().await?;
     Ok(())
 }
+
+/// Obtain a token with the application credential, no scope in the request.
+async fn app_cred_token(cred_id: &str, secret: &str) -> Result<(String, serde_json::Value)> {
+    let body = serde_json::json!({
+        "auth": {
+            "identity": {
+                "methods": ["application_credential"],
+                "application_credential": {"id": cred_id, "secret": secret}
+            }
+        }
+    });
+    let rsp = common::raw_request(http::Method::POST, "v3/auth/tokens", None, Some(body)).await?;
+    assert_eq!(rsp.status(), reqwest::StatusCode::CREATED);
+    let token = rsp
+        .headers()
+        .get("X-Subject-Token")
+        .expect("token header")
+        .to_str()?
+        .to_string();
+    Ok((token, rsp.json().await?))
+}
+
+#[tokio::test]
+async fn test_auth_by_application_credential_other_project_forbidden() -> Result<()> {
+    let secret = "other_project_secret";
+    let (user, project, cred_id, _) = setup_user_with_app_cred(secret).await?;
+
+    // Another existing project the user is granted a role on.
+    let admin = Arc::new(AsyncOpenStack::new(&CloudConfig::from_env()?).await?);
+    let other = create_project(
+        &admin,
+        ProjectCreateBuilder::default()
+            .domain_id("default")
+            .parent_id("default")
+            .name(format!("prj_{}", Uuid::new_v4().simple()))
+            .is_domain(false)
+            .enabled(true)
+            .build()?,
+    )
+    .await?;
+    let roles: HashMap<String, String> = list_roles(&admin)
+        .await?
+        .into_iter()
+        .map(|r| (r.name, r.id))
+        .collect();
+    add_project_grant(
+        &admin,
+        &other.id,
+        &user.id,
+        roles.get("member").expect("member role must exist"),
+    )
+    .await?;
+
+    // Scope in the authentication request, other project.
+    let body = serde_json::json!({
+        "auth": {
+            "identity": {
+                "methods": ["application_credential"],
+                "application_credential": {"id": &cred_id, "secret": secret}
+            },
+            "scope": {"project": {"id": &other.id}}
+        }
+    });
+    let rsp = common::raw_request(http::Method::POST, "v3/auth/tokens", None, Some(body)).await?;
+    assert_eq!(rsp.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // Rescope by token to the other project.
+    let (token, _) = app_cred_token(&cred_id, secret).await?;
+    let body = serde_json::json!({
+        "auth": {
+            "identity": {"methods": ["token"], "token": {"id": &token}},
+            "scope": {"project": {"id": &other.id}}
+        }
+    });
+    let rsp = common::raw_request(http::Method::POST, "v3/auth/tokens", None, Some(body)).await?;
+    assert_eq!(rsp.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // Rescope by token to the default domain.
+    let body = serde_json::json!({
+        "auth": {
+            "identity": {"methods": ["token"], "token": {"id": &token}},
+            "scope": {"domain": {"id": "default"}}
+        }
+    });
+    let rsp = common::raw_request(http::Method::POST, "v3/auth/tokens", None, Some(body)).await?;
+    assert_eq!(rsp.status(), reqwest::StatusCode::FORBIDDEN);
+
+    other.delete().await?;
+    user.delete().await?;
+    project.delete().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_auth_by_application_credential_token_reauth_keeps_expiry() -> Result<()> {
+    let secret = "reauth_expiry_secret";
+    let (user, project, cred_id, _) = setup_user_with_app_cred(secret).await?;
+
+    let (token, first) = app_cred_token(&cred_id, secret).await?;
+    let first_expires = first["token"]["expires_at"]
+        .as_str()
+        .expect("expires_at")
+        .to_string();
+
+    // Ensure a freshly computed expiration would differ.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let body = serde_json::json!({
+        "auth": {"identity": {"methods": ["token"], "token": {"id": &token}}}
+    });
+    let rsp = common::raw_request(http::Method::POST, "v3/auth/tokens", None, Some(body)).await?;
+    assert_eq!(rsp.status(), reqwest::StatusCode::CREATED);
+    let second: serde_json::Value = rsp.json().await?;
+    // Token payloads keep second precision only: compare up to the seconds.
+    let second_expires = second["token"]["expires_at"].as_str().expect("expires_at");
+    assert_eq!(
+        &second_expires[..19],
+        &first_expires[..19],
+        "the token obtained by re-authentication must inherit the expiration"
+    );
+    assert_eq!(
+        second["token"]["project"]["id"].as_str(),
+        Some(project.id.as_str())
+    );
+
+    user.delete().await?;
+    project.delete().await?;
+    Ok(())
+}
