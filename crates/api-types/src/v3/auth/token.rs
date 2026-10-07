@@ -199,6 +199,13 @@ pub struct Identity {
     #[cfg_attr(feature = "validate", validate(nested))]
     pub totp: Option<TotpAuth>,
 
+    /// The application credential object, contains the authentication
+    /// information for application credential authentication.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "builder", builder(default))]
+    #[cfg_attr(feature = "validate", validate(nested))]
+    pub application_credential: Option<ApplicationCredentialAuth>,
+
     /// Catch-all for a method name not among the builtins above - e.g.
     /// `identity.<plugin_name>` for a `mode = full_auth` dynamic auth
     /// plugin (ADR 0025 §4). Bounded by the same overall request
@@ -395,6 +402,100 @@ fn validate_token_auth_secret(value: &TokenAuth) -> Result<(), validator::Valida
     crate::common::validate_secret_length(&value.id, 1024)
 }
 
+/// The application credential object for authentication.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(
+    feature = "builder",
+    derive(derive_builder::Builder),
+    builder(
+        build_fn(error = "crate::error::BuilderError", validate = "Self::validate"),
+        setter(strip_option, into)
+    )
+)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "validate", derive(validator::Validate))]
+#[cfg_attr(
+    feature = "validate",
+    validate(schema(function = "validate_application_credential_auth_secret"))
+)]
+pub struct ApplicationCredentialAuth {
+    /// Application credential ID.
+    #[cfg_attr(feature = "builder", builder(default))]
+    #[cfg_attr(feature = "validate", validate(length(max = 64)))]
+    pub id: Option<String>,
+    /// Application credential name (alternative to ID, requires `user`).
+    #[cfg_attr(feature = "builder", builder(default))]
+    #[cfg_attr(feature = "validate", validate(length(max = 255)))]
+    pub name: Option<String>,
+    /// Application credential secret.
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
+    #[serde(serialize_with = "crate::common::serialize_secret_string")]
+    pub secret: SecretString,
+    /// User reference, required when authenticating by name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "builder", builder(default))]
+    #[cfg_attr(feature = "validate", validate(nested))]
+    pub user: Option<ApplicationCredentialUser>,
+}
+
+#[cfg(feature = "builder")]
+impl ApplicationCredentialAuthBuilder {
+    fn validate(&self) -> Result<(), String> {
+        let has_id = self.id.as_ref().is_some_and(|v| v.is_some());
+        let has_name = self.name.as_ref().is_some_and(|v| v.is_some());
+        if !has_id && !has_name {
+            return Err("application credential requires at least id or name".into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "validate")]
+fn validate_application_credential_auth_secret(
+    value: &ApplicationCredentialAuth,
+) -> Result<(), validator::ValidationError> {
+    crate::common::validate_secret_length(&value.secret, 255)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(
+    feature = "builder",
+    derive(derive_builder::Builder),
+    builder(
+        build_fn(error = "crate::error::BuilderError", validate = "Self::validate"),
+        setter(strip_option, into)
+    )
+)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "validate", derive(validator::Validate))]
+pub struct ApplicationCredentialUser {
+    /// User ID.
+    #[cfg_attr(feature = "builder", builder(default))]
+    #[cfg_attr(feature = "validate", validate(length(max = 64)))]
+    pub id: Option<String>,
+    /// User name.
+    #[cfg_attr(feature = "builder", builder(default))]
+    #[cfg_attr(feature = "validate", validate(length(max = 255)))]
+    pub name: Option<String>,
+    /// User domain (needed when resolving by name).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "builder", builder(default))]
+    #[cfg_attr(feature = "validate", validate(nested))]
+    pub domain: Option<Domain>,
+}
+
+#[cfg(feature = "builder")]
+impl ApplicationCredentialUserBuilder {
+    fn validate(&self) -> Result<(), String> {
+        let has_id = self.id.as_ref().is_some_and(|v| v.is_some());
+        let has_name = self.name.as_ref().is_some_and(|v| v.is_some());
+        if !has_id && !has_name {
+            return Err("application credential user requires at least id or name".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
 #[cfg_attr(feature = "validate", derive(validator::Validate))]
@@ -443,6 +544,44 @@ mod tests {
     use super::*;
 
     const PWD: &str = "hunter2-plaintext";
+
+    #[cfg(feature = "builder")]
+    #[test]
+    fn application_credential_auth_builder_requires_id_or_name() {
+        assert!(
+            ApplicationCredentialAuthBuilder::default()
+                .secret("secret")
+                .build()
+                .is_err(),
+            "neither id nor name"
+        );
+        assert!(
+            ApplicationCredentialAuthBuilder::default()
+                .id("id")
+                .secret("secret")
+                .build()
+                .is_ok()
+        );
+        assert!(
+            ApplicationCredentialAuthBuilder::default()
+                .name("name")
+                .secret("secret")
+                .build()
+                .is_ok()
+        );
+    }
+
+    #[cfg(feature = "builder")]
+    #[test]
+    fn application_credential_user_builder_requires_id_or_name() {
+        assert!(ApplicationCredentialUserBuilder::default().build().is_err());
+        assert!(
+            ApplicationCredentialUserBuilder::default()
+                .id("uid")
+                .build()
+                .is_ok()
+        );
+    }
 
     #[test]
     fn validate_token_parameters_accepts_lenient_bool_query_values() {

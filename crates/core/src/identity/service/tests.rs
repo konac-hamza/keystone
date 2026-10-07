@@ -376,6 +376,104 @@ async fn test_authenticate_by_totp_rate_limited() {
     ));
 }
 
+/// The ID takes precedence for the lookup, but a name given in addition must
+/// match the user. A mismatch is indistinguishable from an invalid passcode.
+#[tokio::test]
+async fn test_authenticate_by_totp_id_with_mismatching_name_rejected() {
+    let mut credential_mock = MockCredentialProvider::default();
+    credential_mock
+        .expect_list_credentials_for_user()
+        .returning(|_, _, _| Ok(vec![totp_credential("uid")]));
+    let state = get_mocked_state(
+        None,
+        Some(Provider::mocked_builder().mock_credential(credential_mock)),
+    )
+    .await;
+    let mut backend = MockIdentityBackend::default();
+    backend
+        .expect_check_user_exist()
+        .returning(|_, _, _, _| Ok("uid".to_string()));
+    backend
+        .expect_get_user()
+        .returning(|_, _| Ok(Some(totp_user("uid", "did", true))));
+    let provider = IdentityService::from_driver(backend);
+
+    for (name, ok) in [("uname", true), ("other", false)] {
+        let result = provider
+            .authenticate_by_totp(
+                &ExecutionContext::internal(&state),
+                &UserTotpAuthRequestBuilder::default()
+                    .id("uid")
+                    .name(name)
+                    .passcode(TOTP_PASSCODE_COUNTER_0)
+                    .build()
+                    .unwrap(),
+            )
+            .await;
+        if ok {
+            assert!(result.is_ok());
+        } else {
+            assert!(matches!(
+                result,
+                Err(IdentityProviderError::Authentication {
+                    source: AuthenticationError::TotpPasscodeInvalid
+                })
+            ));
+        }
+    }
+}
+
+/// Same precedence/consistency rule for password authentication: a domain ID
+/// that does not match the user's domain is rejected as a wrong password.
+#[tokio::test]
+async fn test_authenticate_by_password_id_with_mismatching_domain_rejected() {
+    let state = get_mocked_state(None, None).await;
+    let mut backend = MockIdentityBackend::default();
+    backend.expect_authenticate_by_password().returning(|_, _| {
+        Ok(AuthenticationResultBuilder::default()
+            .context(AuthenticationContext::Password)
+            .principal(PrincipalInfo {
+                identity: IdentityInfo::User(
+                    UserIdentityInfoBuilder::default()
+                        .user_id("uid")
+                        .user(totp_user("uid", "did", true))
+                        .build()
+                        .unwrap(),
+                ),
+            })
+            .build()
+            .unwrap())
+    });
+    let provider = IdentityService::from_driver(backend);
+
+    for (domain_id, ok) in [("did", true), ("other", false)] {
+        let result = provider
+            .authenticate_by_password(
+                &ExecutionContext::internal(&state),
+                &UserPasswordAuthRequest {
+                    id: Some("uid".into()),
+                    domain: Some(Domain {
+                        id: Some(domain_id.into()),
+                        name: None,
+                    }),
+                    password: "pass".into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        if ok {
+            assert!(result.is_ok());
+        } else {
+            assert!(matches!(
+                result,
+                Err(IdentityProviderError::Authentication {
+                    source: AuthenticationError::UserNameOrPasswordWrong
+                })
+            ));
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_authenticate_by_totp_wrong_passcode() {
     let mut credential_mock = MockCredentialProvider::default();

@@ -16,6 +16,27 @@ use openstack_keystone_core_types::error::BuilderError;
 
 use crate::v3::auth::token as api_types;
 
+impl From<&crate::scope::Domain> for openstack_keystone_core_types::identity::Domain {
+    fn from(value: &crate::scope::Domain) -> Self {
+        Self {
+            id: value.id.clone(),
+            name: value.name.clone(),
+        }
+    }
+}
+
+impl From<api_types::ApplicationCredentialUser>
+    for openstack_keystone_core_types::application_credential::UserAuthRef
+{
+    fn from(value: api_types::ApplicationCredentialUser) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            domain: value.domain.as_ref().map(Into::into),
+        }
+    }
+}
+
 impl TryFrom<api_types::UserPassword>
     for openstack_keystone_core_types::identity::UserPasswordAuthRequest
 {
@@ -31,15 +52,9 @@ impl TryFrom<api_types::UserPassword>
             upa.name(name);
         }
         if let Some(domain) = &value.domain {
-            let mut domain_builder =
-                openstack_keystone_core_types::identity::DomainBuilder::default();
-            if let Some(id) = &domain.id {
-                domain_builder.id(id);
-            }
-            if let Some(name) = &domain.name {
-                domain_builder.name(name);
-            }
-            upa.domain(domain_builder.build()?);
+            upa.domain(openstack_keystone_core_types::identity::Domain::from(
+                domain,
+            ));
         }
         upa.password(value.password);
         upa.build()
@@ -59,15 +74,9 @@ impl TryFrom<api_types::TotpUser> for openstack_keystone_core_types::identity::U
             uta.name(name);
         }
         if let Some(domain) = &value.domain {
-            let mut domain_builder =
-                openstack_keystone_core_types::identity::DomainBuilder::default();
-            if let Some(id) = &domain.id {
-                domain_builder.id(id);
-            }
-            if let Some(name) = &domain.name {
-                domain_builder.name(name);
-            }
-            uta.domain(domain_builder.build()?);
+            uta.domain(openstack_keystone_core_types::identity::Domain::from(
+                domain,
+            ));
         }
         uta.passcode(value.passcode);
         uta.build()

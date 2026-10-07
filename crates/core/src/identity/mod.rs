@@ -43,6 +43,7 @@ pub mod hook;
 mod provider_api;
 pub mod service;
 pub mod shadow_id;
+pub(crate) mod user_ref;
 
 pub use error::IdentityProviderError;
 pub use hook::IdentityHook;

@@ -551,6 +551,12 @@ mod application_credential {
 
         #[async_trait]
         impl ApplicationCredentialApi for ApplicationCredentialProvider {
+            async fn authenticate_by_application_credential<'a>(
+                &self,
+                ctx: &ExecutionContext<'a>,
+                auth: &ApplicationCredentialAuthRequest,
+            ) -> Result<AuthenticationResult, ApplicationCredentialProviderError>;
+
             async fn create_access_rule<'a>(
                 &self,
                 ctx: &ExecutionContext<'a>,

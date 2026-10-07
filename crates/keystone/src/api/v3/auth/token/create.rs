@@ -30,7 +30,7 @@ use openstack_keystone_core_types::auth::*;
 
 use openstack_keystone_core::api::common::get_authz_info;
 use openstack_keystone_core::auth::ExecutionContext;
-use openstack_keystone_core_types::scope::Scope as ProviderScope;
+use openstack_keystone_core_types::scope::{Project as ScopeProject, Scope as ProviderScope};
 
 use crate::api::common::PeerAddr;
 use crate::api::v3::auth::token::common::authenticate_request;
@@ -130,7 +130,28 @@ async fn create_inner(
     .await?;
     let ctx = SecurityContext::try_from(auth_res)?;
     *known_initiator = Some(build_initiator_from_principal(ctx.principal()));
-    let provider_scope: Option<ProviderScope> = req.auth.scope.clone().map(Into::into);
+    // Application credentials are bound to a single project, which is derived
+    // from the credential. Same as in python keystone, requesting a scope is
+    // prohibited, also when exchanging an application credential token. The
+    // bound project is passed as the scope; `SecurityContext` rejects every
+    // other one.
+    let provider_scope: Option<ProviderScope> =
+        if let AuthenticationContext::ApplicationCredential {
+            application_credential,
+            ..
+        } = ctx.authentication_context()
+        {
+            if req.auth.scope.is_some() {
+                return Err(AuthenticationError::ScopeNotAllowed.into());
+            }
+            Some(ProviderScope::Project(ScopeProject {
+                id: Some(application_credential.project_id.clone()),
+                name: None,
+                domain: None,
+            }))
+        } else {
+            req.auth.scope.clone().map(Into::into)
+        };
     let authz_info = get_authz_info(state, provider_scope.as_ref()).await?;
 
     // This is a new authentication/reauthentication. Check if that is allowed
@@ -209,6 +230,9 @@ mod tests {
     use openstack_keystone_config::{
         Config, ConfigManager, Interface, ProxyHeader, RateLimitSection,
     };
+    use openstack_keystone_core_types::application_credential::{
+        ApplicationCredentialAuthData, ApplicationCredentialAuthRequest,
+    };
     use openstack_keystone_core_types::auth::*;
     use openstack_keystone_core_types::identity::{IdentityProviderError, UserPasswordAuthRequest};
     use openstack_keystone_core_types::resource::{Domain, DomainBuilder, Project};
@@ -216,6 +240,7 @@ mod tests {
     use secrecy::ExposeSecret;
 
     use crate::api::v3::auth::token::types::*;
+    use crate::application_credential::MockApplicationCredentialProvider;
     use crate::assignment::MockAssignmentProvider;
     use crate::catalog::MockCatalogProvider;
     use crate::identity::MockIdentityProvider;
@@ -1255,6 +1280,640 @@ mod tests {
         );
     }
 
+    fn app_cred_auth_body() -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "auth": {
+                "identity": {
+                    "methods": ["application_credential"],
+                    "application_credential": {
+                        "id": "app_cred_id",
+                        "secret": "app_cred_secret"
+                    }
+                }
+            }
+        }))
+        .unwrap()
+    }
+
+    fn app_cred_auth_body_by_name() -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "auth": {
+                "identity": {
+                    "methods": ["application_credential"],
+                    "application_credential": {
+                        "name": "my_app_cred",
+                        "secret": "app_cred_secret",
+                        "user": {
+                            "id": "uid"
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_post_application_credential() {
+        let config = Config::default();
+        let project = Project {
+            id: "pid".into(),
+            domain_id: "pdid".into(),
+            enabled: true,
+            ..Default::default()
+        };
+        let user_domain = Domain {
+            id: "user_domain_id".into(),
+            enabled: true,
+            ..Default::default()
+        };
+        let project_domain = Domain {
+            id: "pdid".into(),
+            enabled: true,
+            ..Default::default()
+        };
+
+        let mut assignment_mock = MockAssignmentProvider::default();
+        assignment_mock
+            .expect_list_role_assignments()
+            .returning(|_, _| Ok(Vec::new()));
+
+        let mut catalog_mock = MockCatalogProvider::default();
+        catalog_mock
+            .expect_get_catalog()
+            .returning(|_, _| Ok(Vec::new()));
+
+        let auth = AuthenticationResultBuilder::default()
+            .context(AuthenticationContext::ApplicationCredential {
+                application_credential: openstack_keystone_core_types::application_credential::ApplicationCredentialBuilder::default()
+                    .id("app_cred_id")
+                    .name("my_app_cred")
+                    .project_id("pid")
+                    .user_id("uid")
+                    .unrestricted(false)
+                    .roles(vec![])
+                    .build()
+                    .unwrap(),
+                token: None,
+            })
+            .principal(PrincipalInfo {
+                identity: IdentityInfo::User(
+                    UserIdentityInfoBuilder::default()
+                        .user_id("uid")
+                        .build()
+                        .unwrap(),
+                ),
+            })
+            .build()
+            .unwrap();
+
+        let mut app_cred_mock = MockApplicationCredentialProvider::default();
+        app_cred_mock
+            .expect_authenticate_by_application_credential()
+            .returning(move |_, _| Ok(auth.clone()));
+
+        let mut identity_mock = MockIdentityProvider::default();
+        identity_mock.expect_get_user().returning(|_, _| {
+            use openstack_keystone_core_types::identity::UserResponse;
+            Ok(Some(UserResponse {
+                id: "uid".into(),
+                name: "uname".into(),
+                domain_id: "user_domain_id".into(),
+                enabled: true,
+                default_project_id: None,
+                extra: std::collections::HashMap::new(),
+                federated: None,
+                options: openstack_keystone_core_types::identity::UserOptions::default(),
+                password_expires_at: None,
+            }))
+        });
+
+        let mut resource_mock = MockResourceProvider::default();
+        resource_mock
+            .expect_get_project()
+            .withf(|_, id: &'_ str| id == "pid")
+            .returning(move |_, _| Ok(Some(project.clone())));
+        resource_mock
+            .expect_get_domain()
+            .withf(|_, id: &'_ str| id == "user_domain_id")
+            .returning(move |_, _| Ok(Some(user_domain.clone())));
+        resource_mock
+            .expect_get_domain()
+            .withf(|_, id: &'_ str| id == "pdid")
+            .returning(move |_, _| Ok(Some(project_domain.clone())));
+
+        let mut token_mock = MockTokenProvider::default();
+        let vsc_for_mock = {
+            use openstack_keystone_core_types::auth::AuthzInfoBuilder;
+            use openstack_keystone_core_types::resource::ProjectBuilder;
+            use openstack_keystone_core_types::token::FernetToken;
+            let user_resp = openstack_keystone_core_types::identity::UserResponseBuilder::default()
+                .id("uid")
+                .name("uname".to_string())
+                .domain_id("user_domain_id".to_string())
+                .enabled(true)
+                .build()
+                .unwrap();
+            let fernet_payload = openstack_keystone_core_types::token::ProjectScopePayload {
+                user_id: "uid".into(),
+                methods: Vec::from(["application_credential".to_string()]),
+                project_id: "pid".into(),
+                ..Default::default()
+            };
+            let authz = AuthzInfoBuilder::default()
+                .roles(vec![])
+                .scope(ScopeInfo::Project {
+                    project: ProjectBuilder::default()
+                        .id("pid")
+                        .domain_id("pdid")
+                        .enabled(true)
+                        .name("pname")
+                        .build()
+                        .unwrap(),
+                    project_domain: DomainBuilder::default()
+                        .id("pdid")
+                        .name("pdname")
+                        .enabled(true)
+                        .build()
+                        .unwrap(),
+                })
+                .build()
+                .unwrap();
+            let sc = SecurityContext::test_build()
+                .authentication_context(AuthenticationContext::ApplicationCredential {
+                    application_credential: openstack_keystone_core_types::application_credential::ApplicationCredentialBuilder::default()
+                        .id("app_cred_id")
+                        .name("my_app_cred")
+                        .project_id("pid")
+                        .user_id("uid")
+                        .unrestricted(false)
+                        .roles(vec![])
+                        .build()
+                        .unwrap(),
+                    token: None,
+                })
+                .principal(PrincipalInfo {
+                    identity: IdentityInfo::User(
+                        UserIdentityInfoBuilder::default()
+                            .user_id("uid")
+                            .user(user_resp)
+                            .user_domain(
+                                DomainBuilder::default()
+                                    .id("user_domain_id")
+                                    .name("user_domain_name")
+                                    .enabled(true)
+                                    .build()
+                                    .unwrap(),
+                            )
+                            .build()
+                            .unwrap(),
+                    ),
+                })
+                .token(FernetToken::ProjectScope(fernet_payload))
+                .authorization(authz)
+                .build();
+            openstack_keystone_core::auth::ValidatedSecurityContext::test_new(sc)
+        };
+        let vsc_clone = vsc_for_mock.clone();
+        token_mock
+            .expect_issue_token_context()
+            .returning(move |_, _, _| Ok(vsc_clone.clone()));
+        token_mock
+            .expect_encode_token()
+            .returning(|_| Ok("token".to_string()));
+
+        let provider = Provider::mocked_builder()
+            .mock_application_credential(app_cred_mock)
+            .mock_assignment(assignment_mock)
+            .mock_catalog(catalog_mock)
+            .mock_identity(identity_mock)
+            .mock_resource(resource_mock)
+            .mock_token(token_mock)
+            .build()
+            .unwrap();
+
+        let state = Arc::new(
+            Service::new(
+                ConfigManager::not_watched(config),
+                DatabaseConnection::default(),
+                provider,
+                Arc::new(MockPolicy::default()),
+                AuditDispatcher::noop(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state.clone());
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(app_cred_auth_body()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let res: TokenResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(vec!["application_credential"], res.token.methods);
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_post_application_credential_explicit_scope_forbidden() {
+        let auth = AuthenticationResultBuilder::default()
+            .context(AuthenticationContext::ApplicationCredential {
+                application_credential: openstack_keystone_core_types::application_credential::ApplicationCredentialBuilder::default()
+                    .id("app_cred_id")
+                    .name("my_app_cred")
+                    .project_id("pid")
+                    .user_id("uid")
+                    .unrestricted(false)
+                    .roles(vec![])
+                    .build()
+                    .unwrap(),
+                token: None,
+            })
+            .principal(PrincipalInfo {
+                identity: IdentityInfo::User(
+                    UserIdentityInfoBuilder::default()
+                        .user_id("uid")
+                        .build()
+                        .unwrap(),
+                ),
+            })
+            .build()
+            .unwrap();
+        let mut app_cred_mock = MockApplicationCredentialProvider::default();
+        app_cred_mock
+            .expect_authenticate_by_application_credential()
+            .returning(move |_, _| Ok(auth.clone()));
+        // No other provider is mocked: the request must be rejected before
+        // scope resolution and token issuance.
+        let provider = Provider::mocked_builder()
+            .mock_application_credential(app_cred_mock)
+            .build()
+            .unwrap();
+        let state = Arc::new(
+            Service::new(
+                ConfigManager::not_watched(Config::default()),
+                DatabaseConnection::default(),
+                provider,
+                Arc::new(MockPolicy::default()),
+                AuditDispatcher::noop(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state.clone());
+
+        // Even the credential's own project must not be requested.
+        let body = serde_json::to_vec(&json!({
+            "auth": {
+                "identity": {
+                    "methods": ["application_credential"],
+                    "application_credential": {"id": "app_cred_id", "secret": "app_cred_secret"}
+                },
+                "scope": {"project": {"id": "pid"}}
+            }
+        }))
+        .unwrap();
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_post_application_credential_auth_failed() {
+        let config = Config::default();
+
+        let mut app_cred_mock = MockApplicationCredentialProvider::default();
+        app_cred_mock
+            .expect_authenticate_by_application_credential()
+            .returning(|_, _| {
+                Err(
+                    openstack_keystone_core_types::application_credential::ApplicationCredentialProviderError::AuthenticationFailed,
+                )
+            });
+
+        let provider = Provider::mocked_builder()
+            .mock_application_credential(app_cred_mock)
+            .build()
+            .unwrap();
+
+        let state = Arc::new(
+            Service::new(
+                ConfigManager::not_watched(config),
+                DatabaseConnection::default(),
+                provider,
+                Arc::new(MockPolicy::default()),
+                AuditDispatcher::noop(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state.clone());
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(app_cred_auth_body()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_post_application_credential_by_name() {
+        let config = Config::default();
+
+        let auth = AuthenticationResultBuilder::default()
+            .context(AuthenticationContext::ApplicationCredential {
+                application_credential: openstack_keystone_core_types::application_credential::ApplicationCredentialBuilder::default()
+                    .id("app_cred_id")
+                    .name("my_app_cred")
+                    .project_id("pid")
+                    .user_id("uid")
+                    .unrestricted(false)
+                    .roles(vec![])
+                    .build()
+                    .unwrap(),
+                token: None,
+            })
+            .principal(PrincipalInfo {
+                identity: IdentityInfo::User(
+                    UserIdentityInfoBuilder::default()
+                        .user_id("uid")
+                        .build()
+                        .unwrap(),
+                ),
+            })
+            .build()
+            .unwrap();
+
+        let mut app_cred_mock = MockApplicationCredentialProvider::default();
+        app_cred_mock
+            .expect_authenticate_by_application_credential()
+            .withf(|_, auth: &ApplicationCredentialAuthRequest| {
+    matches!(&auth.credential, ApplicationCredentialAuthData::Name(by_name) if by_name.name == "my_app_cred")
+})
+.returning(move |_, _| Ok(auth.clone()));
+
+        let mut identity_mock = MockIdentityProvider::default();
+        identity_mock.expect_get_user().returning(|_, _| {
+            use openstack_keystone_core_types::identity::UserResponse;
+            Ok(Some(UserResponse {
+                id: "uid".into(),
+                name: "uname".into(),
+                domain_id: "user_domain_id".into(),
+                enabled: true,
+                default_project_id: None,
+                extra: std::collections::HashMap::new(),
+                federated: None,
+                options: openstack_keystone_core_types::identity::UserOptions::default(),
+                password_expires_at: None,
+            }))
+        });
+
+        let mut assignment_mock = MockAssignmentProvider::default();
+        assignment_mock
+            .expect_list_role_assignments()
+            .returning(|_, _| Ok(Vec::new()));
+
+        let mut catalog_mock = MockCatalogProvider::default();
+        catalog_mock
+            .expect_get_catalog()
+            .returning(|_, _| Ok(Vec::new()));
+
+        let mut resource_mock = MockResourceProvider::default();
+        resource_mock.expect_get_project().returning(move |_, _| {
+            Ok(Some(Project {
+                id: "pid".into(),
+                domain_id: "pdid".into(),
+                enabled: true,
+                ..Default::default()
+            }))
+        });
+        resource_mock.expect_get_domain().returning(move |_, _| {
+            Ok(Some(Domain {
+                id: "pdid".into(),
+                enabled: true,
+                ..Default::default()
+            }))
+        });
+
+        let mut token_mock = MockTokenProvider::default();
+        let vsc_for_mock = {
+            use openstack_keystone_core_types::auth::AuthzInfoBuilder;
+            use openstack_keystone_core_types::resource::ProjectBuilder;
+            use openstack_keystone_core_types::token::FernetToken;
+            let user_resp = openstack_keystone_core_types::identity::UserResponseBuilder::default()
+                .id("uid")
+                .name("uname".to_string())
+                .domain_id("user_domain_id".to_string())
+                .enabled(true)
+                .build()
+                .unwrap();
+            let fernet_payload = openstack_keystone_core_types::token::ProjectScopePayload {
+                user_id: "uid".into(),
+                methods: Vec::from(["application_credential".to_string()]),
+                project_id: "pid".into(),
+                ..Default::default()
+            };
+            let authz = AuthzInfoBuilder::default()
+                .roles(vec![])
+                .scope(ScopeInfo::Project {
+                    project: ProjectBuilder::default()
+                        .id("pid")
+                        .domain_id("pdid")
+                        .enabled(true)
+                        .name("pname")
+                        .build()
+                        .unwrap(),
+                    project_domain: DomainBuilder::default()
+                        .id("pdid")
+                        .name("pdname")
+                        .enabled(true)
+                        .build()
+                        .unwrap(),
+                })
+                .build()
+                .unwrap();
+            let sc = SecurityContext::test_build()
+                .authentication_context(AuthenticationContext::ApplicationCredential {
+                    application_credential: openstack_keystone_core_types::application_credential::ApplicationCredentialBuilder::default()
+                        .id("app_cred_id")
+                        .name("my_app_cred")
+                        .project_id("pid")
+                        .user_id("uid")
+                        .unrestricted(false)
+                        .roles(vec![])
+                        .build()
+                        .unwrap(),
+                    token: None,
+                })
+                .principal(PrincipalInfo {
+                    identity: IdentityInfo::User(
+                        UserIdentityInfoBuilder::default()
+                            .user_id("uid")
+                            .user(user_resp)
+                            .user_domain(
+                                DomainBuilder::default()
+                                    .id("user_domain_id")
+                                    .name("user_domain_name")
+                                    .enabled(true)
+                                    .build()
+                                    .unwrap(),
+                            )
+                            .build()
+                            .unwrap(),
+                    ),
+                })
+                .token(FernetToken::ProjectScope(fernet_payload))
+                .authorization(authz)
+                .build();
+            openstack_keystone_core::auth::ValidatedSecurityContext::test_new(sc)
+        };
+        let vsc_clone = vsc_for_mock.clone();
+        token_mock
+            .expect_issue_token_context()
+            .returning(move |_, _, _| Ok(vsc_clone.clone()));
+        token_mock
+            .expect_encode_token()
+            .returning(|_| Ok("token".to_string()));
+
+        let provider = Provider::mocked_builder()
+            .mock_application_credential(app_cred_mock)
+            .mock_assignment(assignment_mock)
+            .mock_catalog(catalog_mock)
+            .mock_identity(identity_mock)
+            .mock_resource(resource_mock)
+            .mock_token(token_mock)
+            .build()
+            .unwrap();
+
+        let state = Arc::new(
+            Service::new(
+                ConfigManager::not_watched(config),
+                DatabaseConnection::default(),
+                provider,
+                Arc::new(MockPolicy::default()),
+                AuditDispatcher::noop(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state.clone());
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(app_cred_auth_body_by_name()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_post_application_credential_expired() {
+        let config = Config::default();
+
+        let mut app_cred_mock = MockApplicationCredentialProvider::default();
+        app_cred_mock
+            .expect_authenticate_by_application_credential()
+.returning(|_, _| {
+                    Err(
+                    openstack_keystone_core_types::application_credential::ApplicationCredentialProviderError::ApplicationCredentialExpired,
+                )
+            });
+
+        let provider = Provider::mocked_builder()
+            .mock_application_credential(app_cred_mock)
+            .build()
+            .unwrap();
+
+        let state = Arc::new(
+            Service::new(
+                ConfigManager::not_watched(config),
+                DatabaseConnection::default(),
+                provider,
+                Arc::new(MockPolicy::default()),
+                AuditDispatcher::noop(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state.clone());
+
+        let response = api
+            .as_service()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(app_cred_auth_body()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[tokio::test]
     async fn test_failure_after_authentication_is_attributed_to_the_principal() {
         use axum::extract::ConnectInfo;
@@ -1747,7 +2406,7 @@ mod auth_plugin_http_tests {
                 "auth": {
                     "identity": {
                         "methods": ["application_credential"],
-                        "application_credential": {"id": "tf-alice"}
+                        "application_credential": {"id": "tf-alice", "secret": "tf-alice-secret"}
                     }
                 }
             }),

@@ -37,6 +37,7 @@ use crate::auth::{
 };
 use crate::domain_config::DomainConfigResolver;
 use crate::events::AuditDispatchError;
+use crate::identity::user_ref::{resolve_user_domain, user_matches_ref};
 use crate::identity::{IdentityApi, IdentityProviderError, backend::IdentityBackend};
 use crate::keystone::ServiceState;
 use crate::plugin_manager::PluginManagerApi;
@@ -461,27 +462,13 @@ impl IdentityService {
     ) -> Result<AuthenticationResult, IdentityProviderError> {
         let state = ctx.state();
         let mut auth = auth.clone();
-        if auth.id.is_none() {
-            if auth.name.is_none() {
-                return Err(IdentityProviderError::UserIdOrNameWithDomain);
-            }
-
-            if let Some(ref mut domain) = auth.domain {
-                if let Some(dname) = &domain.name {
-                    let d = state
-                        .provider
-                        .get_resource_provider()
-                        .find_domain_by_name(ctx, dname)
-                        .await?
-                        .ok_or(ResourceProviderError::DomainNotFound(dname.clone()))?;
-                    domain.id = Some(d.id);
-                } else if domain.id.is_none() {
-                    return Err(IdentityProviderError::UserIdOrNameWithDomain);
-                }
-            } else {
-                return Err(IdentityProviderError::UserIdOrNameWithDomain);
-            }
-        }
+        resolve_user_domain(
+            ctx,
+            auth.id.as_deref(),
+            auth.name.as_deref(),
+            &mut auth.domain,
+        )
+        .await?;
 
         // Per-user rate limit (ADR-0022): when the bucket is enabled, resolve
         // the caller-supplied reference to the canonical user ID with a cheap
@@ -518,7 +505,18 @@ impl IdentityService {
             }
         }
 
-        driver.authenticate_by_password(state, &auth).await
+        let res = driver.authenticate_by_password(state, &auth).await?;
+        // The ID took precedence for the lookup. Name/domain given in addition
+        // must match, verified only after the password is proven so a mismatch
+        // is indistinguishable from a wrong password.
+        if auth.id.is_some()
+            && let IdentityInfo::User(ref ui) = res.principal.identity
+            && let Some(ref user) = ui.user
+            && !user_matches_ref(ctx, user, auth.name.as_deref(), auth.domain.as_ref()).await?
+        {
+            return Err(AuthenticationError::UserNameOrPasswordWrong.into());
+        }
+        Ok(res)
     }
 }
 
@@ -806,27 +804,13 @@ impl IdentityApi for IdentityService {
     ) -> Result<AuthenticationResult, IdentityProviderError> {
         let state = ctx.state();
         let mut auth = auth.clone();
-        if auth.id.is_none() {
-            if auth.name.is_none() {
-                return Err(IdentityProviderError::UserIdOrNameWithDomain);
-            }
-
-            if let Some(ref mut domain) = auth.domain {
-                if let Some(dname) = &domain.name {
-                    let d = state
-                        .provider
-                        .get_resource_provider()
-                        .find_domain_by_name(ctx, dname)
-                        .await?
-                        .ok_or(ResourceProviderError::DomainNotFound(dname.clone()))?;
-                    domain.id = Some(d.id);
-                } else if domain.id.is_none() {
-                    return Err(IdentityProviderError::UserIdOrNameWithDomain);
-                }
-            } else {
-                return Err(IdentityProviderError::UserIdOrNameWithDomain);
-            }
-        }
+        resolve_user_domain(
+            ctx,
+            auth.id.as_deref(),
+            auth.name.as_deref(),
+            &mut auth.domain,
+        )
+        .await?;
 
         // The resolution above guarantees either `auth.id`, or `auth.name` +
         // `auth.domain.id`, is populated at this point. The cheap existence
@@ -897,6 +881,15 @@ impl IdentityApi for IdentityService {
         });
 
         if !matched {
+            return Err(AuthenticationError::TotpPasscodeInvalid.into());
+        }
+
+        // The ID took precedence for the lookup. Name/domain given in addition
+        // must match, checked after the passcode so a mismatch is
+        // indistinguishable from an invalid passcode.
+        if auth.id.is_some()
+            && !user_matches_ref(ctx, &user, auth.name.as_deref(), auth.domain.as_ref()).await?
+        {
             return Err(AuthenticationError::TotpPasscodeInvalid.into());
         }
 
