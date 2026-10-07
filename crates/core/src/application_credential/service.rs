@@ -39,6 +39,7 @@ use crate::auth::{
 };
 
 use crate::events::AuditDispatchError;
+use crate::identity::user_ref::user_matches_ref;
 use crate::plugin_manager::PluginManagerApi;
 /// Application Credential Provider.
 pub struct ApplicationCredentialService {
@@ -78,7 +79,8 @@ impl ApplicationCredentialService {
     ) -> Result<Option<String>, ApplicationCredentialProviderError> {
         let state = ctx.state();
         if let Some(id) = &user.id {
-            // When both ID and name are given, the name must match as well.
+            // The ID takes precedence for the lookup; name and domain, when
+            // given as well, must match the user (same as password/TOTP).
             let Some(found) = state
                 .provider
                 .get_identity_provider()
@@ -88,30 +90,12 @@ impl ApplicationCredentialService {
             else {
                 return Ok(None);
             };
-            if user.name.as_ref().is_some_and(|name| *name != found.name) {
-                return Ok(None);
-            }
-            if let Some(domain) = &user.domain
-                && domain
-                    .id
-                    .as_ref()
-                    .is_some_and(|did| *did != found.domain_id)
-            {
-                return Ok(None);
-            }
-            if let Some(domain_name) = user.domain.as_ref().and_then(|d| d.name.as_ref()) {
-                // The domain name must match the domain of the user as well.
-                let user_domain = state
-                    .provider
-                    .get_resource_provider()
-                    .get_domain(ctx, &found.domain_id)
+            return Ok(
+                user_matches_ref(ctx, &found, user.name.as_deref(), user.domain.as_ref())
                     .await
-                    .map_err(|e| ApplicationCredentialProviderError::Driver(e.to_string()))?;
-                if user_domain.is_none_or(|d| d.name != *domain_name) {
-                    return Ok(None);
-                }
-            }
-            return Ok(Some(found.id));
+                    .map_err(|e| ApplicationCredentialProviderError::Driver(e.to_string()))?
+                    .then_some(found.id),
+            );
         }
         let (Some(name), Some(domain)) = (&user.name, &user.domain) else {
             return Ok(None);
@@ -194,7 +178,7 @@ impl ApplicationCredentialApi for ApplicationCredentialService {
     /// bound project and project domain are enabled, and whether the
     /// credential may be used for a given scope, is validated centrally
     /// by [`SecurityContext`](crate::auth::SecurityContext) and
-    /// `ValidatedSecurityContext`.
+    /// `ValidatedSecurityContext`, which also resolves the user domain.
     ///
     /// # Parameters
     /// - `ctx`: The execution context.
@@ -258,16 +242,11 @@ impl ApplicationCredentialApi for ApplicationCredentialService {
             .map_err(|_| ApplicationCredentialProviderError::AuthenticationFailed)?
             .ok_or(ApplicationCredentialProviderError::AuthenticationFailed)?;
 
-        // --- 6. Fetch user domain for identity info ---
-        let user_domain = state
-            .provider
-            .get_resource_provider()
-            .get_domain(ctx, &user.domain_id)
-            .await
-            .map_err(|_| ApplicationCredentialProviderError::AuthenticationFailed)?
-            .ok_or(ApplicationCredentialProviderError::AuthenticationFailed)?;
-
-        // --- 7. Build the authentication result ---
+        // --- 6. Build the authentication result ---
+        //
+        // The user domain is intentionally not resolved here: like for the
+        // other methods it is resolved (and verified) centrally by
+        // `ValidatedSecurityContext::new_for_scope`.
         Ok(AuthenticationResultBuilder::default()
             .context(AuthenticationContext::ApplicationCredential {
                 application_credential: app_cred,
@@ -278,7 +257,6 @@ impl ApplicationCredentialApi for ApplicationCredentialService {
                     UserIdentityInfoBuilder::default()
                         .user_id(user.id.clone())
                         .user(user)
-                        .user_domain(user_domain)
                         .build()?,
                 ),
             })
@@ -1051,7 +1029,7 @@ mod tests {
                 &by_id(Some(UserAuthRef {
                     id: Some("uid".into()),
                     name: None,
-                    domain: Some(openstack_keystone_core_types::scope::Domain {
+                    domain: Some(openstack_keystone_core_types::identity::Domain {
                         id: None,
                         name: Some("fake".into()),
                     }),

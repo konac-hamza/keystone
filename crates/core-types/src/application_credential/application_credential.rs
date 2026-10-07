@@ -266,7 +266,8 @@ pub struct UserAuthRef {
     pub name: Option<String>,
     /// User domain (needed when resolving by name).
     #[builder(default)]
-    pub domain: Option<crate::scope::Domain>,
+    #[validate(nested)]
+    pub domain: Option<crate::identity::Domain>,
 }
 
 /// Validates that at least `id` or `name` is present.

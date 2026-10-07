@@ -66,17 +66,18 @@ fn app_cred_identity_by_name(name: &str, secret: &str, user_id: &str) -> Identit
 }
 
 /// Authenticate the user with password, then create an application credential
-/// via raw HTTP. Returns the credential ID.
-async fn create_app_cred_for_user(
+/// via raw HTTP, sending the secret only when given. Returns the creation
+/// response.
+async fn create_app_cred_raw(
     user_id: &str,
     user_name: &str,
     password: &str,
     user_domain_id: &str,
     project_id: &str,
     project_domain_id: &str,
-    app_cred_secret: &str,
+    app_cred_secret: Option<&str>,
     roles: &[serde_json::Value],
-) -> Result<(String, String)> {
+) -> Result<serde_json::Value> {
     let mut tc = common::TestClient::new()?;
     tc.auth_password(
         common::get_password_auth(user_name, password, user_domain_id)?,
@@ -89,14 +90,15 @@ async fn create_app_cred_for_user(
     )
     .await?;
 
-    let app_cred_name = format!("ac_{}", Uuid::new_v4().simple());
-    let create_body = serde_json::json!({
+    let mut create_body = serde_json::json!({
         "application_credential": {
-            "name": &app_cred_name,
-            "secret": app_cred_secret,
+            "name": format!("ac_{}", Uuid::new_v4().simple()),
             "roles": roles,
         }
     });
+    if let Some(secret) = app_cred_secret {
+        create_body["application_credential"]["secret"] = secret.into();
+    }
     let rsp = common::raw_request(
         http::Method::POST,
         &format!("v3/users/{}/application_credentials", user_id),
@@ -105,12 +107,43 @@ async fn create_app_cred_for_user(
     )
     .await?;
     assert_eq!(rsp.status(), reqwest::StatusCode::CREATED);
-    let cred_resp: serde_json::Value = rsp.json().await?;
-    let cred_id = cred_resp["application_credential"]["id"]
-        .as_str()
-        .expect("app cred id must be present")
-        .to_string();
-    Ok((cred_id, app_cred_name))
+    Ok(rsp.json().await?)
+}
+
+/// Create an application credential with the given secret. Returns the
+/// credential ID and name.
+async fn create_app_cred_for_user(
+    user_id: &str,
+    user_name: &str,
+    password: &str,
+    user_domain_id: &str,
+    project_id: &str,
+    project_domain_id: &str,
+    app_cred_secret: &str,
+    roles: &[serde_json::Value],
+) -> Result<(String, String)> {
+    let cred_resp = create_app_cred_raw(
+        user_id,
+        user_name,
+        password,
+        user_domain_id,
+        project_id,
+        project_domain_id,
+        Some(app_cred_secret),
+        roles,
+    )
+    .await?;
+    let cred = &cred_resp["application_credential"];
+    Ok((
+        cred["id"]
+            .as_str()
+            .expect("app cred id must be present")
+            .to_string(),
+        cred["name"]
+            .as_str()
+            .expect("app cred name must be present")
+            .to_string(),
+    ))
 }
 #[tokio::test]
 async fn test_auth_by_application_credential_id() -> Result<()> {
@@ -788,6 +821,112 @@ async fn test_auth_by_application_credential_name_with_user_name_and_domain() ->
     assert_eq!(rsp.status(), reqwest::StatusCode::CREATED);
     let token_resp: serde_json::Value = rsp.json().await?;
     assert_eq!(token_resp["token"]["user"]["id"].as_str().unwrap(), user.id);
+
+    user.delete().await?;
+    project.delete().await?;
+    Ok(())
+}
+
+/// The secret is generated when the creation request does not carry one (same
+/// as python keystone), is returned in the response and authenticates.
+#[tokio::test]
+async fn test_auth_by_application_credential_generated_secret() -> Result<()> {
+    let admin = Arc::new(AsyncOpenStack::new(&CloudConfig::from_env()?).await?);
+    let password = "TestPassword123!";
+    let user = create_user(
+        &admin,
+        UserCreateBuilder::default()
+            .name(format!("usr_{}", Uuid::new_v4().simple()))
+            .domain_id("default")
+            .enabled(true)
+            .password(password)
+            .build()?,
+    )
+    .await?;
+    let project = create_project(
+        &admin,
+        ProjectCreateBuilder::default()
+            .domain_id("default")
+            .parent_id("default")
+            .name(format!("prj_{}", Uuid::new_v4().simple()))
+            .is_domain(false)
+            .enabled(true)
+            .build()?,
+    )
+    .await?;
+    let roles: HashMap<String, String> = list_roles(&admin)
+        .await?
+        .into_iter()
+        .map(|r| (r.name, r.id))
+        .collect();
+    let member = roles.get("member").expect("member role must exist");
+    add_project_grant(&admin, &project.id, &user.id, member).await?;
+
+    let cred_resp = create_app_cred_raw(
+        &user.id,
+        &user.name,
+        password,
+        &user.domain_id,
+        &project.id,
+        "default",
+        None,
+        &[serde_json::json!({"id": member, "name": "member"})],
+    )
+    .await?;
+    let cred = &cred_resp["application_credential"];
+    let cred_id = cred["id"].as_str().expect("id").to_string();
+    let cred_name = cred["name"].as_str().expect("name").to_string();
+    let secret = cred["secret"]
+        .as_str()
+        .expect("a generated secret must be returned on creation")
+        .to_string();
+    assert!(!secret.is_empty());
+
+    let authenticate = |identity: serde_json::Value| async move {
+        common::raw_request(
+            http::Method::POST,
+            "v3/auth/tokens",
+            None,
+            Some(serde_json::json!({
+                "auth": {
+                    "identity": {
+                        "methods": ["application_credential"],
+                        "application_credential": identity
+                    }
+                }
+            })),
+        )
+        .await
+    };
+
+    // By ID.
+    let rsp = authenticate(serde_json::json!({"id": &cred_id, "secret": &secret})).await?;
+    assert_eq!(rsp.status(), reqwest::StatusCode::CREATED);
+    let token_resp: serde_json::Value = rsp.json().await?;
+    assert_eq!(token_resp["token"]["user"]["id"].as_str().unwrap(), user.id);
+
+    // By name.
+    let rsp = authenticate(serde_json::json!({
+        "name": &cred_name,
+        "secret": &secret,
+        "user": {"id": &user.id}
+    }))
+    .await?;
+    assert_eq!(rsp.status(), reqwest::StatusCode::CREATED);
+
+    // A modified secret is rejected. The first character is modified: bcrypt
+    // only considers the first 72 bytes and the generated secret is longer.
+    let flipped = format!(
+        "{}{}",
+        if secret.starts_with('A') { 'B' } else { 'A' },
+        &secret[1..]
+    );
+    let rsp = authenticate(serde_json::json!({
+        "id": &cred_id,
+        "secret": flipped
+    }))
+    .await?;
+    assert_eq!(rsp.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     user.delete().await?;
     project.delete().await?;

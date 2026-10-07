@@ -128,6 +128,20 @@ async fn test_revoke_user_project_grant_auth_impact() -> Result<()> {
         )
         .await?;
 
+    let authz = ScopeInfo::Project {
+        project: ProjectBuilder::default()
+            .id(cred.project_id.clone())
+            .name(project.id.clone())
+            .domain_id(project.domain_id.clone())
+            .enabled(true)
+            .build()?,
+        project_domain: DomainBuilder::default()
+            .id(domain.id.clone())
+            .name(domain.name.clone())
+            .enabled(true)
+            .build()?,
+    };
+
     let auth = AuthenticationResultBuilder::default()
         .context(AuthenticationContext::ApplicationCredential {
             application_credential: cred.clone().into(),
@@ -147,11 +161,7 @@ async fn test_revoke_user_project_grant_auth_impact() -> Result<()> {
     let pre_revoke_token_context = state
         .provider
         .get_token_provider()
-        .issue_token_context(
-            &ExecutionContext::internal(&state),
-            &ctx,
-            &ScopeInfo::Unscoped,
-        )
+        .issue_token_context(&ExecutionContext::internal(&state), &ctx, &authz.clone())
         .await?;
     let pre_revoke_encoded = state
         .provider
@@ -212,11 +222,7 @@ async fn test_revoke_user_project_grant_auth_impact() -> Result<()> {
     let post_revoke_token_ctx = state
         .provider
         .get_token_provider()
-        .issue_token_context(
-            &ExecutionContext::internal(&state),
-            &ctx,
-            &ScopeInfo::Unscoped,
-        )
+        .issue_token_context(&ExecutionContext::internal(&state), &ctx, &authz.clone())
         .await?;
     let post_revoke_encoded = state
         .provider

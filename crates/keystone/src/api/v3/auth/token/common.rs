@@ -195,11 +195,7 @@ pub(super) async fn authenticate_request(
                 let credential = if let Some(id) = &app_cred.id {
                     ApplicationCredentialAuthData::Id(ApplicationCredentialAuthById {
                         id: id.clone(),
-                        user: app_cred.user.as_ref().map(|u| UserAuthRef {
-                            id: u.id.clone(),
-                            name: u.name.clone(),
-                            domain: u.domain.clone().map(Into::into),
-                        }),
+                        user: app_cred.user.clone().map(UserAuthRef::from),
                     })
                 } else if let Some(name) = &app_cred.name {
                     let user = app_cred.user.as_ref().ok_or(KeystoneApiError::BadRequest(
@@ -207,11 +203,7 @@ pub(super) async fn authenticate_request(
                     ))?;
                     ApplicationCredentialAuthData::Name(ApplicationCredentialAuthByName {
                         name: name.clone(),
-                        user: UserAuthRef {
-                            id: user.id.clone(),
-                            name: user.name.clone(),
-                            domain: user.domain.clone().map(Into::into),
-                        },
+                        user: UserAuthRef::from(user.clone()),
                     })
                 } else {
                     return Err(KeystoneApiError::BadRequest(

@@ -16,6 +16,7 @@
 use std::ops::Deref;
 
 use eyre::Report;
+use secrecy::ExposeSecret;
 use tracing_test::traced_test;
 use uuid::Uuid;
 
@@ -569,6 +570,92 @@ async fn create_cred(
         .await?)
 }
 
+/// The secret is generated when not provided at creation (same as python
+/// keystone), returned once in the creation response, and is the one that
+/// authenticates, by ID and by name.
+#[tokio::test]
+#[traced_test]
+async fn test_authenticate_by_app_cred_with_generated_secret() -> Result<(), Report> {
+    let (state, _) = get_state().await?;
+    let domain = create_domain!(state)?;
+    let project = create_project!(state, domain.id.clone())?;
+    let user = create_user!(state, domain.id.clone())?;
+    let provider = state.provider.get_application_credential_provider();
+    let ctx = ExecutionContext::internal(&state);
+
+    let create = |name: &str| ApplicationCredentialCreate {
+        name: name.to_string(),
+        project_id: project.id.clone(),
+        roles: vec![],
+        secret: None,
+        user_id: user.id.clone(),
+        ..Default::default()
+    };
+    let name = Uuid::new_v4().to_string();
+    let cred = provider
+        .create_application_credential(&ctx, create(&name))
+        .await?;
+    let other = provider
+        .create_application_credential(&ctx, create(&Uuid::new_v4().to_string()))
+        .await?;
+
+    let secret = cred.secret.expose_secret().to_string();
+    assert!(!secret.is_empty(), "a secret must be generated");
+    assert_ne!(
+        secret,
+        other.secret.expose_secret(),
+        "generated secrets must be unique"
+    );
+
+    // By ID with the generated secret.
+    let result = provider
+        .authenticate_by_application_credential(&ctx, &auth_request_by_id(&cred.id, &secret))
+        .await?;
+    assert!(matches!(
+        result.context,
+        AuthenticationContext::ApplicationCredential { ref application_credential, .. }
+            if application_credential.id == cred.id
+    ));
+
+    // By name (and owning user) with the generated secret.
+    let by_name = ApplicationCredentialAuthRequest {
+        secret: secret.clone().into(),
+        credential: ApplicationCredentialAuthData::Name(ApplicationCredentialAuthByName {
+            name: name.clone(),
+            user: UserAuthRef {
+                id: Some(user.id.clone()),
+                name: None,
+                domain: None,
+            },
+        }),
+    };
+    provider
+        .authenticate_by_application_credential(&ctx, &by_name)
+        .await?;
+
+    // The secret of another credential and a modified one must not work. The
+    // first character is modified: bcrypt only considers the first 72 bytes
+    // and the generated secret is longer than that.
+    let flipped = format!(
+        "{}{}",
+        if secret.starts_with('A') { 'B' } else { 'A' },
+        &secret[1..]
+    );
+    for wrong in [other.secret.expose_secret().to_string(), flipped] {
+        let result = provider
+            .authenticate_by_application_credential(&ctx, &auth_request_by_id(&cred.id, &wrong))
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(ApplicationCredentialProviderError::AuthenticationFailed)
+            ),
+            "only the generated secret must authenticate"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 #[traced_test]
 async fn test_authenticate_by_app_cred_id_with_foreign_user_rejected() -> Result<(), Report> {
@@ -661,7 +748,7 @@ async fn test_authenticate_by_app_cred_name_with_user_name_and_domain() -> Resul
             &by_name(UserAuthRef {
                 id: None,
                 name: Some(user.name.clone()),
-                domain: Some(openstack_keystone_core_types::scope::Domain {
+                domain: Some(openstack_keystone_core_types::identity::Domain {
                     id: Some(domain.id.clone()),
                     name: None,
                 }),
@@ -675,7 +762,7 @@ async fn test_authenticate_by_app_cred_name_with_user_name_and_domain() -> Resul
             &by_name(UserAuthRef {
                 id: None,
                 name: Some(user.name.clone()),
-                domain: Some(openstack_keystone_core_types::scope::Domain {
+                domain: Some(openstack_keystone_core_types::identity::Domain {
                     id: None,
                     name: Some(domain.name.clone()),
                 }),
@@ -741,42 +828,58 @@ async fn test_issue_token_app_cred_scope_rules() -> Result<(), Report> {
     let ctx = SecurityContext::try_from(auth_result)?;
     let token_provider = state.provider.get_token_provider();
 
-    // Even the credential's own project must not be requested explicitly.
-    let own_project_scope = ScopeInfo::Project {
-        project: openstack_keystone_core_types::resource::ProjectBuilder::default()
-            .id(&project.id)
-            .name("own")
-            .domain_id(&domain.id)
-            .enabled(true)
-            .build()?,
-        project_domain: openstack_keystone_core_types::resource::DomainBuilder::default()
-            .id(&domain.id)
-            .name("test")
-            .enabled(true)
-            .build()?,
+    // The handler passes the credential's project as the scope; the gate
+    // accepts only that one.
+    let project_scope = |id: &str| -> Result<ScopeInfo, Report> {
+        Ok(ScopeInfo::Project {
+            project: openstack_keystone_core_types::resource::ProjectBuilder::default()
+                .id(id)
+                .name("own")
+                .domain_id(&domain.id)
+                .enabled(true)
+                .build()?,
+            project_domain: openstack_keystone_core_types::resource::DomainBuilder::default()
+                .id(&domain.id)
+                .name("test")
+                .enabled(true)
+                .build()?,
+        })
     };
-    assert!(
-        matches!(
-            token_provider
-                .issue_token_context(&state, &ctx, &own_project_scope)
-                .await,
-            Err(TokenProviderError::Authentication(
-                AuthenticationError::ScopeNotAllowed
-            ))
-        ),
-        "explicit scope must be rejected for app cred authentication"
-    );
-
-    // Without scope, the project scope is derived from the credential.
+    let own_project_scope = project_scope(&project.id)?;
     let vsc = token_provider
-        .issue_token_context(&state, &ctx, &ScopeInfo::Unscoped)
+        .issue_token_context(&state, &ctx, &own_project_scope)
         .await?;
     assert!(matches!(
         vsc.inner().authorization().map(|a| &a.scope),
         Some(ScopeInfo::Project { project: p, .. }) if p.id == project.id
     ));
 
-    // An application credential token cannot be exchanged for a scoped one.
+    // Anything else is rejected: no scope, another project, a domain.
+    for scope in [
+        ScopeInfo::Unscoped,
+        project_scope("other-project")?,
+        ScopeInfo::Domain(
+            openstack_keystone_core_types::resource::DomainBuilder::default()
+                .id(&domain.id)
+                .name("test")
+                .enabled(true)
+                .build()?,
+        ),
+    ] {
+        assert!(
+            matches!(
+                token_provider
+                    .issue_token_context(&state, &ctx, &scope)
+                    .await,
+                Err(TokenProviderError::Authentication(
+                    AuthenticationError::ScopeNotAllowed
+                ))
+            ),
+            "only the bound project scope is allowed: {scope:?}"
+        );
+    }
+
+    // The same holds when exchanging an application credential token.
     let reauth = SecurityContext::try_from(
         AuthenticationResultBuilder::default()
             .context(AuthenticationContext::ApplicationCredential {
@@ -789,7 +892,7 @@ async fn test_issue_token_app_cred_scope_rules() -> Result<(), Report> {
     assert!(
         matches!(
             token_provider
-                .issue_token_context(&state, &reauth, &own_project_scope)
+                .issue_token_context(&state, &reauth, &ScopeInfo::Unscoped)
                 .await,
             Err(TokenProviderError::Authentication(
                 AuthenticationError::ScopeNotAllowed
@@ -797,9 +900,8 @@ async fn test_issue_token_app_cred_scope_rules() -> Result<(), Report> {
         ),
         "scope must be rejected when exchanging an app cred token"
     );
-    // Without scope the exchange derives the project scope again.
     let exchanged = token_provider
-        .issue_token_context(&state, &reauth, &ScopeInfo::Unscoped)
+        .issue_token_context(&state, &reauth, &own_project_scope)
         .await?;
     assert!(matches!(
         exchanged.inner().authorization().map(|a| &a.scope),

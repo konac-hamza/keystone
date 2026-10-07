@@ -30,7 +30,7 @@ use openstack_keystone_core_types::auth::*;
 
 use openstack_keystone_core::api::common::get_authz_info;
 use openstack_keystone_core::auth::ExecutionContext;
-use openstack_keystone_core_types::scope::Scope as ProviderScope;
+use openstack_keystone_core_types::scope::{Project as ScopeProject, Scope as ProviderScope};
 
 use crate::api::common::PeerAddr;
 use crate::api::v3::auth::token::common::authenticate_request;
@@ -132,15 +132,26 @@ async fn create_inner(
     *known_initiator = Some(build_initiator_from_principal(ctx.principal()));
     // Application credentials are bound to a single project, which is derived
     // from the credential. Same as in python keystone, requesting a scope is
-    // prohibited, also when exchanging an application credential token.
-    if matches!(
-        ctx.authentication_context(),
-        AuthenticationContext::ApplicationCredential { .. }
-    ) && req.auth.scope.is_some()
-    {
-        return Err(AuthenticationError::ScopeNotAllowed.into());
-    }
-    let provider_scope: Option<ProviderScope> = req.auth.scope.clone().map(Into::into);
+    // prohibited, also when exchanging an application credential token. The
+    // bound project is passed as the scope; `SecurityContext` rejects every
+    // other one.
+    let provider_scope: Option<ProviderScope> =
+        if let AuthenticationContext::ApplicationCredential {
+            application_credential,
+            ..
+        } = ctx.authentication_context()
+        {
+            if req.auth.scope.is_some() {
+                return Err(AuthenticationError::ScopeNotAllowed.into());
+            }
+            Some(ProviderScope::Project(ScopeProject {
+                id: Some(application_credential.project_id.clone()),
+                name: None,
+                domain: None,
+            }))
+        } else {
+            req.auth.scope.clone().map(Into::into)
+        };
     let authz_info = get_authz_info(state, provider_scope.as_ref()).await?;
 
     // This is a new authentication/reauthentication. Check if that is allowed
