@@ -75,6 +75,18 @@ impl TryFrom<api_types::RoleAssignmentListParameters>
 
     fn try_from(value: api_types::RoleAssignmentListParameters) -> Result<Self, Self::Error> {
         let mut builder = provider_types::RoleAssignmentListParametersBuilder::default();
+        // Parity with Python Keystone (`api/role_assignments.py`).
+        if value.user_id.is_some() && value.group_id.is_some() {
+            return Err(KeystoneApiError::BadRequest(
+                "Specify a user or group, not both".into(),
+            ));
+        }
+        if value.effective.is_some_and(|x| x) && value.group_id.is_some() {
+            return Err(KeystoneApiError::BadRequest(
+                "Combining effective and group filter will always result in an empty list".into(),
+            ));
+        }
+
         // Filter by role
         if let Some(val) = &value.role_id {
             builder.role_id(val);
@@ -216,5 +228,64 @@ mod tests {
             })
             .unwrap()
         );
+    }
+
+    fn convert(
+        params: RoleAssignmentListParameters,
+    ) -> Result<provider_types::RoleAssignmentListParameters, crate::error::KeystoneApiError> {
+        params.try_into()
+    }
+
+    #[test]
+    fn test_list_parameters_user_and_group_rejected() {
+        let res = convert(RoleAssignmentListParameters {
+            user_id: Some("uid".into()),
+            group_id: Some("gid".into()),
+            ..Default::default()
+        });
+        assert!(matches!(
+            res,
+            Err(crate::error::KeystoneApiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn test_list_parameters_effective_group_rejected() {
+        let res = convert(RoleAssignmentListParameters {
+            group_id: Some("gid".into()),
+            effective: Some(true),
+            ..Default::default()
+        });
+        assert!(matches!(
+            res,
+            Err(crate::error::KeystoneApiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn test_list_parameters_valid_combinations() {
+        let group = convert(RoleAssignmentListParameters {
+            group_id: Some("gid".into()),
+            effective: Some(false),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(group.group_id.as_deref(), Some("gid"));
+
+        let group_no_effective = convert(RoleAssignmentListParameters {
+            group_id: Some("gid".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(group_no_effective.group_id.as_deref(), Some("gid"));
+
+        let user = convert(RoleAssignmentListParameters {
+            user_id: Some("uid".into()),
+            effective: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(user.user_id.as_deref(), Some("uid"));
+        assert_eq!(user.effective, Some(true));
     }
 }

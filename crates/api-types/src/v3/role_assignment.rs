@@ -142,7 +142,7 @@ pub struct AssignmentList {
 }
 
 /// List role assignments query parameters.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
 #[cfg_attr(feature = "validate", derive(validator::Validate))]
 pub struct RoleAssignmentListParameters {
